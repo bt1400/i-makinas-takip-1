@@ -952,7 +952,7 @@ Rep repMusteri(int scope) {
     ['Müşteri', 'İş', 'Borç', 'Alınan', 'Kalan', 'Durum', 'En eski ödenmemiş'],
     [for (final s in l) [s.name, s.n, s.borc, s.alinan, s.kalan, durumAd[s.durum]!, (s.oldest != null && s.kalan > 0.5) ? dshow(s.oldest) : '']],
     sub: '${l.length} müşteri · Tarih: ${dshow(todayIso())}',
-    foot: ['TOPLAM', l.fold(0, (a, s) => a + s.n), l.fold(0.0, (a, s) => a + s.borc), l.fold(0.0, (a, s) => a + s.alinan), l.fold(0.0, (a, s) => a + s.kalan), '', ''],
+    foot: ['TOPLAM', l.fold<int>(0, (a, s) => a + s.n), l.fold<double>(0.0, (a, s) => a + s.borc), l.fold<double>(0.0, (a, s) => a + s.alinan), l.fold<double>(0.0, (a, s) => a + s.kalan), '', ''],
     money: {2, 3, 4},
     extra: [
       Rep('Is detayi', ['Müşteri', 'Tarih', 'Makina', 'Miktar', 'Birim ücret', 'Borç', 'Alınan'],
@@ -989,7 +989,7 @@ Rep repMakina(int m) {
     ['Makina', 'Çalışma', 'Mazot L', 'L/birim', 'Gelir', 'Mazot ₺', 'Kâr'],
     [for (final s in l) [s.name, s.calisma, s.litre, s.lPerUnit, s.gelir, s.mazotTl, s.kar]],
     sub: 'Dönem: ${aylar[m]}',
-    foot: ['TOPLAM', '', l.fold(0.0, (a, s) => a + s.litre), '', l.fold(0.0, (a, s) => a + s.gelir), l.fold(0.0, (a, s) => a + s.mazotTl), l.fold(0.0, (a, s) => a + s.kar)],
+    foot: ['TOPLAM', '', l.fold<double>(0.0, (a, s) => a + s.litre), '', l.fold<double>(0.0, (a, s) => a + s.gelir), l.fold<double>(0.0, (a, s) => a + s.mazotTl), l.fold<double>(0.0, (a, s) => a + s.kar)],
     money: {4, 5, 6},
   );
 }
