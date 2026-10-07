@@ -1,12 +1,14 @@
 import 'dart:convert';
-import 'dart:io' show File;
+import 'dart:io' show Directory, File;
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
+import 'package:image_picker/image_picker.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 typedef R = Map<String, String>;
 
@@ -67,6 +69,11 @@ String dparse(String s) {
   return s.trim();
 }
 
+String nowHm() {
+  final d = DateTime.now();
+  return '${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}';
+}
+
 String todayIso() => DateTime.now().toIso8601String().substring(0, 10);
 int mon(R r) => int.tryParse((r['tarih'] ?? '').length >= 7 ? r['tarih']!.substring(5, 7) : '') ?? 0;
 double borc(R r) => qty(r['miktar'] ?? '') * toD(r['ucret']);
@@ -95,6 +102,25 @@ class CStat {
   String get durum => (borc <= 0 && alinan <= 0) ? 'yok' : (alinan <= 0 ? 'hic' : (kalan <= 0.5 ? 'tam' : 'kismen'));
 }
 
+class BStat {
+  final R r;
+  double worked = 0;
+  int days = 0;
+  double? kalanSaat;
+  int? kalanGun;
+  String durum = 'ok';
+  BStat(this.r);
+  String get makina => r['makina'] ?? '';
+  String get tur => (r['tur'] ?? '').isEmpty ? 'Bakım' : r['tur']!;
+  double get aralik => toD(r['aralik']);
+  double get gun => toD(r['gun']);
+  double get ratio {
+    final a = aralik > 0 ? worked / aralik : 0.0, b = gun > 0 ? days / gun : 0.0;
+    final m = a > b ? a : b;
+    return m < 0 ? 0 : (m > 1 ? 1 : m);
+  }
+}
+
 class MStat {
   final String name;
   double hrs = 0, trips = 0, litre = 0, gelir = 0, mazotTl = 0;
@@ -108,6 +134,8 @@ class MStat {
 class Store extends ChangeNotifier {
   List<R> isler = [], giderler = [], mazot = [];
   List<String> musteriler = [], makinalar = [];
+  List<R> bakim = [];
+  Map<String, String> telefon = {}, foto = {}, ayar = {};
   late File _f;
   Map<String, CStat>? _cs;
   List<CStat>? _top;
@@ -135,9 +163,14 @@ class Store extends ChangeNotifier {
     mazot = c;
     musteriler = d;
     makinalar = e;
+    Map<String, String> lm(String k) => Map<String, String>.from((j[k] ?? {}) as Map);
+    bakim = lr('bakim');
+    telefon = lm('telefon');
+    foto = lm('foto');
+    ayar = lm('ayar');
   }
 
-  String export() => jsonEncode({'isler': isler, 'giderler': giderler, 'mazot': mazot, 'musteriler': musteriler, 'makinalar': makinalar});
+  String export() => jsonEncode({'isler': isler, 'giderler': giderler, 'mazot': mazot, 'musteriler': musteriler, 'makinalar': makinalar, 'bakim': bakim, 'telefon': telefon, 'foto': foto, 'ayar': ayar});
   void commit() {
     _cs = null;
     _top = null;
@@ -146,7 +179,12 @@ class Store extends ChangeNotifier {
   }
 
   Future<void> reset() async {
+    final b = bakim, t = telefon, f = foto, a = ayar;
     _parse(await rootBundle.loadString('assets/data.json'));
+    bakim = b;
+    telefon = t;
+    foto = f;
+    ayar = a;
     commit();
   }
 
@@ -244,6 +282,42 @@ class Store extends ChangeNotifier {
 
   int rank(String name) => top5.indexWhere((s) => norm(s.name) == norm(name));
 
+  // Bakım hatırlatmaları: her (makina, bakım türü) için son kayıt, çalışma saati ve gün hesabı
+  List<BStat> get bakimDurum {
+    final latest = <String, R>{};
+    for (final r in bakim) {
+      final k = '${norm(r['makina'] ?? '')}|${norm(r['tur'] ?? '')}';
+      final o = latest[k];
+      if (o == null || cmpDate(r, o) >= 0) latest[k] = r;
+    }
+    final out = <BStat>[];
+    for (final r in latest.values) {
+      final b = BStat(r);
+      final k = norm(b.makina);
+      b.worked = sum(isler.where((x) => norm(x['makina'] ?? '') == k && (x['tarih'] ?? '').compareTo(r['tarih'] ?? '') > 0 && (x['miktar'] ?? '').contains(':')), (x) => qty(x['miktar'] ?? ''));
+      b.days = daysSince(r['tarih']);
+      if (b.aralik > 0) b.kalanSaat = b.aralik - b.worked;
+      if (b.gun > 0) b.kalanGun = b.gun.round() - b.days;
+      final ks = b.kalanSaat, kg = b.kalanGun;
+      if (b.aralik <= 0 && b.gun <= 0) {
+        b.durum = 'bilgi';
+      } else if ((ks != null && ks <= 0) || (kg != null && kg <= 0)) {
+        b.durum = 'gec';
+      } else if ((ks != null && ks <= (b.aralik * 0.1 < 10 ? 10 : b.aralik * 0.1)) || (kg != null && kg <= 7)) {
+        b.durum = 'yakin';
+      }
+      out.add(b);
+    }
+    int w(String d) => d == 'gec' ? 0 : (d == 'yakin' ? 1 : (d == 'ok' ? 2 : 3));
+    out.sort((a, b) {
+      final c = w(a.durum).compareTo(w(b.durum));
+      return c != 0 ? c : b.ratio.compareTo(a.ratio);
+    });
+    return out;
+  }
+
+  int get dueCount => bakimDurum.where((b) => b.durum == 'gec' || b.durum == 'yakin').length;
+
   List<MStat> makinaStat(int m) {
     final out = <MStat>[];
     final js = byMonth(isler, m), ms = byMonth(mazot, m);
@@ -295,6 +369,8 @@ class App extends StatelessWidget {
       );
 }
 
+void Function(int)? goTab;
+
 class Home extends StatefulWidget {
   const Home({super.key});
   @override
@@ -304,20 +380,61 @@ class Home extends StatefulWidget {
 class _HomeState extends State<Home> {
   int i = 0;
   @override
+  void initState() {
+    super.initState();
+    goTab = (v) => setState(() => i = v);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final due = S.bakimDurum.where((b) => b.durum == 'gec').toList();
+      if (due.isNotEmpty && mounted) {
+        showDialog(
+            context: context,
+            builder: (x) => AlertDialog(
+                  title: const Text('🔧 Bakım zamanı geldi'),
+                  content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [for (final b in due.take(8)) Text('• ${b.makina} – ${b.tur}')]),
+                  actions: [
+                    TextButton(onPressed: () => Navigator.pop(x), child: const Text('Sonra')),
+                    FilledButton(
+                        onPressed: () {
+                          Navigator.pop(x);
+                          setState(() => i = 5);
+                        },
+                        child: const Text('Bakım sekmesi')),
+                  ],
+                ));
+      }
+    });
+  }
+
+  @override
   Widget build(BuildContext context) => Scaffold(
-        body: IndexedStack(index: i, children: [const OzetTab(), IslerTab(), MazotTab(), const MusteriTab(), const MakinaTab(), GiderTab()]),
-        bottomNavigationBar: NavigationBar(
-          selectedIndex: i,
-          onDestinationSelected: (v) => setState(() => i = v),
-          labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
-          destinations: const [
-            NavigationDestination(icon: Icon(Icons.dashboard_outlined), selectedIcon: Icon(Icons.dashboard), label: 'Özet'),
-            NavigationDestination(icon: Icon(Icons.agriculture_outlined), selectedIcon: Icon(Icons.agriculture), label: 'İşler'),
-            NavigationDestination(icon: Icon(Icons.local_gas_station_outlined), selectedIcon: Icon(Icons.local_gas_station), label: 'Mazot'),
-            NavigationDestination(icon: Icon(Icons.groups_outlined), selectedIcon: Icon(Icons.groups), label: 'Müşteri'),
-            NavigationDestination(icon: Icon(Icons.precision_manufacturing_outlined), selectedIcon: Icon(Icons.precision_manufacturing), label: 'Makina'),
-            NavigationDestination(icon: Icon(Icons.payments_outlined), selectedIcon: Icon(Icons.payments), label: 'Gider'),
-          ],
+        body: IndexedStack(index: i, children: [const OzetTab(), IslerTab(), MazotTab(), const MusteriTab(), const MakinaTab(), BakimTab(), GiderTab()]),
+        bottomNavigationBar: ListenableBuilder(
+          listenable: S,
+          builder: (c, _) {
+            final n = S.dueCount;
+            return BottomNavigationBar(
+              type: BottomNavigationBarType.fixed,
+              currentIndex: i,
+              onTap: (v) => setState(() => i = v),
+              backgroundColor: Colors.white,
+              selectedItemColor: navy,
+              unselectedItemColor: grey,
+              selectedFontSize: 10.5,
+              unselectedFontSize: 10.5,
+              items: [
+                const BottomNavigationBarItem(icon: Icon(Icons.dashboard_outlined), activeIcon: Icon(Icons.dashboard), label: 'Özet'),
+                const BottomNavigationBarItem(icon: Icon(Icons.agriculture_outlined), activeIcon: Icon(Icons.agriculture), label: 'İşler'),
+                const BottomNavigationBarItem(icon: Icon(Icons.local_gas_station_outlined), activeIcon: Icon(Icons.local_gas_station), label: 'Mazot'),
+                const BottomNavigationBarItem(icon: Icon(Icons.groups_outlined), activeIcon: Icon(Icons.groups), label: 'Müşteri'),
+                const BottomNavigationBarItem(icon: Icon(Icons.precision_manufacturing_outlined), activeIcon: Icon(Icons.precision_manufacturing), label: 'Makina'),
+                BottomNavigationBarItem(
+                    icon: Badge(isLabelVisible: n > 0, label: Text('$n'), child: const Icon(Icons.build_circle_outlined)),
+                    activeIcon: Badge(isLabelVisible: n > 0, label: Text('$n'), child: const Icon(Icons.build_circle)),
+                    label: 'Bakım'),
+                const BottomNavigationBarItem(icon: Icon(Icons.payments_outlined), activeIcon: Icon(Icons.payments), label: 'Gider'),
+              ],
+            );
+          },
         ),
       );
 }
@@ -631,7 +748,8 @@ class Rep {
   final List<Object> foot;
   final Set<int> money;
   final List<Rep> extra;
-  Rep(this.title, this.head, this.rows, {this.sub = '', this.foot = const [], this.money = const {}, this.extra = const []});
+  final String? photo;
+  Rep(this.title, this.head, this.rows, {this.sub = '', this.foot = const [], this.money = const {}, this.extra = const [], this.photo});
 }
 
 String cellText(Object v, int col, Rep r, {bool pdf = false}) {
@@ -649,7 +767,18 @@ String toText(Rep r) {
 }
 
 // ---- PDF ----
-List<pw.Widget> _pdfBlock(Rep r) {
+Future<pw.ImageProvider?> _img(String? p) async {
+  try {
+    if (p == null || p.isEmpty) return null;
+    final f = File(p);
+    if (!await f.exists()) return null;
+    return pw.MemoryImage(await f.readAsBytes());
+  } catch (_) {
+    return null;
+  }
+}
+
+List<pw.Widget> _pdfBlock(Rep r, {pw.ImageProvider? logo, pw.ImageProvider? photo, String firm = ''}) {
   final n = r.head.length;
   final w = <int, pw.TableColumnWidth>{};
   for (var i = 0; i < n; i++) {
@@ -672,12 +801,24 @@ List<pw.Widget> _pdfBlock(Rep r) {
       width: double.infinity,
       padding: const pw.EdgeInsets.all(10),
       decoration: pw.BoxDecoration(color: PdfColor.fromHex('#1F2937'), borderRadius: const pw.BorderRadius.all(pw.Radius.circular(6))),
-      child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
-        pw.Text(r.title, style: pw.TextStyle(color: PdfColors.white, fontSize: 15, fontWeight: pw.FontWeight.bold)),
-        if (r.sub.isNotEmpty) pw.Text(r.sub, style: const pw.TextStyle(color: PdfColors.grey300, fontSize: 9)),
+      child: pw.Row(crossAxisAlignment: pw.CrossAxisAlignment.center, children: [
+        pw.Expanded(
+          child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
+            pw.Text(r.title, style: pw.TextStyle(color: PdfColors.white, fontSize: 15, fontWeight: pw.FontWeight.bold)),
+            if (r.sub.isNotEmpty) pw.Text(r.sub, style: const pw.TextStyle(color: PdfColors.grey300, fontSize: 9)),
+            if (firm.isNotEmpty) pw.Text(firm, style: const pw.TextStyle(color: PdfColors.grey400, fontSize: 8)),
+          ]),
+        ),
+        if (logo != null)
+          pw.Container(
+            padding: const pw.EdgeInsets.all(3),
+            decoration: const pw.BoxDecoration(color: PdfColors.white, borderRadius: pw.BorderRadius.all(pw.Radius.circular(4))),
+            child: pw.Image(logo, height: 34),
+          ),
       ]),
     ),
     pw.SizedBox(height: 8),
+    if (photo != null) pw.Container(height: 130, alignment: pw.Alignment.center, margin: const pw.EdgeInsets.only(bottom: 8), child: pw.Image(photo, fit: pw.BoxFit.contain)),
     pw.Table(
       border: pw.TableBorder.all(color: PdfColors.grey400, width: 0.4),
       columnWidths: w,
@@ -700,16 +841,24 @@ List<pw.Widget> _pdfBlock(Rep r) {
 Future<List<int>> toPdf(Rep r) async {
   final reg = pw.Font.ttf(await rootBundle.load('assets/fonts/LiberationSans-Regular.ttf'));
   final bold = pw.Font.ttf(await rootBundle.load('assets/fonts/LiberationSans-Bold.ttf'));
-  final doc = pw.Document(theme: pw.ThemeData.withFont(base: reg, bold: bold));
+  final logo = await _img(S.ayar['logo']);
+  final photo = await _img(r.photo);
+  final firm = [S.ayar['firma'] ?? '', S.ayar['tel'] ?? ''].where((e) => e.isNotEmpty).join(' · ');
+  final doc = pw.Document();
   final wide = r.head.length > 6 || r.extra.any((e) => e.head.length > 6);
+  final water = logo != null && S.ayar['filigran'] == '1';
   doc.addPage(pw.MultiPage(
-    pageFormat: wide ? PdfPageFormat.a4.landscape : PdfPageFormat.a4,
-    margin: const pw.EdgeInsets.all(28),
+    pageTheme: pw.PageTheme(
+      pageFormat: wide ? PdfPageFormat.a4.landscape : PdfPageFormat.a4,
+      margin: const pw.EdgeInsets.all(28),
+      theme: pw.ThemeData.withFont(base: reg, bold: bold),
+      buildBackground: water ? (ctx) => pw.FullPage(ignoreMargins: true, child: pw.Center(child: pw.Opacity(opacity: 0.07, child: pw.Image(logo!, width: 320)))) : null,
+    ),
     footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
-      pw.Text('İş Takip · ${dshow(todayIso())}', style: const pw.TextStyle(fontSize: 8, color: PdfColors.grey600)),
+      pw.Text(firm.isEmpty ? 'İş Takip · ${dshow(todayIso())}' : '$firm · ${dshow(todayIso())}', style: const pw.TextStyle(fontSize: 8, color: PdfColors.grey600)),
       pw.Text('Sayfa ${ctx.pageNumber}/${ctx.pagesCount}', style: const pw.TextStyle(fontSize: 8, color: PdfColors.grey600)),
     ]),
-    build: (ctx) => [..._pdfBlock(r), for (final e in r.extra) ..._pdfBlock(e)],
+    build: (ctx) => [..._pdfBlock(r, logo: logo, photo: photo, firm: firm), for (final e in r.extra) ..._pdfBlock(e, logo: logo)],
   ));
   return doc.save();
 }
@@ -879,31 +1028,46 @@ Future<void> shareBytes(List<int> bytes, String name) async {
   await SharePlus.instance.share(ShareParams(files: [XFile(f.path)], subject: name));
 }
 
-Future<void> exportSheet(BuildContext c, String title, Rep Function(int) build, {List<String> scopes = const []}) =>
-    showModalBottomSheet(context: c, showDragHandle: true, builder: (_) => _ExportSheet(title, build, scopes));
+Future<void> exportSheet(BuildContext c, String title, Rep Function(int, String?) build,
+        {List<String> scopes = const [], String? selLabel, List<String> Function()? selOptions, bool musteri = false}) =>
+    showModalBottomSheet(context: c, showDragHandle: true, isScrollControlled: true, builder: (_) => _ExportSheet(title, build, scopes, selLabel, selOptions, musteri));
 
 class _ExportSheet extends StatefulWidget {
   final String title;
-  final Rep Function(int) build;
+  final Rep Function(int, String?) build;
   final List<String> scopes;
-  const _ExportSheet(this.title, this.build, this.scopes);
+  final String? selLabel;
+  final List<String> Function()? selOptions;
+  final bool musteri;
+  const _ExportSheet(this.title, this.build, this.scopes, this.selLabel, this.selOptions, this.musteri);
   @override
   State<_ExportSheet> createState() => _ExportState();
 }
 
 class _ExportState extends State<_ExportSheet> {
   int scope = 0;
+  String? sel;
   bool busy = false;
 
   Future<void> _go(String t) async {
     setState(() => busy = true);
     try {
-      final r = widget.build(scope);
+      final r = widget.build(scope, sel);
       final slug = '${norm(r.title).replaceAll(RegExp(r'[^a-z0-9]+'), '_')}_${todayIso()}';
       if (t == 'pdf') {
         await shareBytes(await toPdf(r), '$slug.pdf');
       } else if (t == 'xlsx') {
         await shareBytes(toXlsx(r), '$slug.xlsx');
+      } else if (t == 'wa') {
+        final txt = toText(r);
+        final ph = widget.musteri && sel != null ? S.telefon[norm(sel!)] : null;
+        if (txt.length > 1400) {
+          await Clipboard.setData(ClipboardData(text: txt));
+          if (mounted) msg(context, 'Rapor uzun olduğu için panoya kopyalandı. WhatsApp\'ta yapıştırın.');
+          if (mounted) await whatsapp(context, ph, '');
+        } else {
+          await whatsapp(context, ph, txt);
+        }
       } else {
         await Clipboard.setData(ClipboardData(text: toText(r)));
         if (mounted) msg(context, 'Rapor metni panoya kopyalandı.');
@@ -916,23 +1080,47 @@ class _ExportState extends State<_ExportSheet> {
 
   @override
   Widget build(BuildContext context) => SafeArea(
-        child: Padding(
+        child: SingleChildScrollView(
           padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
           child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
             Text(widget.title, style: Theme.of(context).textTheme.titleLarge),
-            if (widget.scopes.length > 1)
+            if (widget.selLabel != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 12),
+                child: Material(
+                  color: sel == null ? Colors.white : amber.withAlpha(40),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14), side: const BorderSide(color: line)),
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(14),
+                    onTap: () async {
+                      final v = await pickKey(context, widget.selLabel!, widget.selOptions!(), sel);
+                      if (v != null) setState(() => sel = v.isEmpty ? null : v);
+                    },
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                      child: Row(children: [
+                        Icon(Icons.filter_alt_outlined, color: sel == null ? grey : navy),
+                        const SizedBox(width: 8),
+                        Expanded(child: Text(sel ?? '${widget.selLabel}: Tümü', style: TextStyle(fontWeight: FontWeight.w600, color: sel == null ? grey : navy))),
+                        if (sel != null) InkWell(onTap: () => setState(() => sel = null), child: const Icon(Icons.close, size: 20)) else const Icon(Icons.arrow_drop_down, color: grey),
+                      ]),
+                    ),
+                  ),
+                ),
+              ),
+            if (widget.scopes.length > 1 && sel == null)
               Padding(
                 padding: const EdgeInsets.only(top: 10),
                 child: Wrap(spacing: 8, children: [
-                  for (var i = 0; i < widget.scopes.length; i++)
-                    ChoiceChip(label: Text(widget.scopes[i]), selected: scope == i, onSelected: (_) => setState(() => scope = i)),
+                  for (var i = 0; i < widget.scopes.length; i++) ChoiceChip(label: Text(widget.scopes[i]), selected: scope == i, onSelected: (_) => setState(() => scope = i)),
                 ]),
               ),
             const SizedBox(height: 6),
             if (busy) const LinearProgressIndicator(),
             ListTile(leading: const Icon(Icons.picture_as_pdf, color: red), title: const Text('PDF olarak paylaş / kaydet'), onTap: busy ? null : () => _go('pdf')),
             ListTile(leading: const Icon(Icons.table_chart, color: green), title: const Text('Excel (.xlsx) olarak paylaş / kaydet'), onTap: busy ? null : () => _go('xlsx')),
-            ListTile(leading: const Icon(Icons.copy), title: const Text('Metin olarak kopyala (WhatsApp için)'), onTap: busy ? null : () => _go('txt')),
+            ListTile(leading: const Icon(Icons.chat, color: Color(0xFF25D366)), title: const Text('WhatsApp\'a metin olarak gönder'), onTap: busy ? null : () => _go('wa')),
+            ListTile(leading: const Icon(Icons.copy), title: const Text('Metin olarak kopyala'), onTap: busy ? null : () => _go('txt')),
           ]),
         ),
       );
@@ -962,8 +1150,15 @@ Rep repMusteri(int scope) {
   );
 }
 
-Rep repGider(int m) {
-  final l = S.byMonth(S.giderler, m);
+Rep repGider(int m, [String? kalem]) {
+  var l = S.byMonth(S.giderler, m);
+  if (kalem != null) l = l.where((r) => norm(r['kalem'] ?? '') == norm(kalem)).toList();
+  final tot = sum(l, (r) => toD(r['tutar']));
+  if (kalem != null) {
+    final d = [...l]..sort(cmpDate);
+    return Rep('Gider - $kalem', ['Tarih', 'Açıklama', 'Tutar'], [for (final r in d) [dshow(r['tarih']), r['aciklama'] ?? '', toD(r['tutar'])]],
+        sub: 'Dönem: ${aylar[m]} · ${l.length} kayıt', foot: ['TOPLAM', '', tot], money: {2});
+  }
   final g = groupBy(l, (r) => r['kalem'] ?? '-')..sort((a, b) => sum(b.l, (r) => toD(r['tutar'])).compareTo(sum(a.l, (r) => toD(r['tutar']))));
   final det = [...l]..sort((a, b) {
       final c = norm(a['kalem'] ?? '').compareTo(norm(b['kalem'] ?? ''));
@@ -974,7 +1169,7 @@ Rep repGider(int m) {
     ['Gider kalemi / kişi', 'Kayıt', 'Toplam'],
     [for (final x in g) [x.key, x.l.length, sum(x.l, (r) => toD(r['tutar']))]],
     sub: 'Dönem: ${aylar[m]} · ${l.length} kayıt',
-    foot: ['TOPLAM', l.length, sum(l, (r) => toD(r['tutar']))],
+    foot: ['TOPLAM', l.length, tot],
     money: {2},
     extra: [
       Rep('Gider detayi', ['Tarih', 'Kalem', 'Tutar', 'Açıklama'], [for (final r in det) [dshow(r['tarih']), r['kalem'] ?? '', toD(r['tutar']), r['aciklama'] ?? '']], sub: 'Tüm gider kayıtları', money: {2})
@@ -982,7 +1177,25 @@ Rep repGider(int m) {
   );
 }
 
-Rep repMakina(int m) {
+Rep repMakina(int m, [String? name]) {
+  if (name != null) {
+    final k = norm(name);
+    final st = S.makinaStat(m).firstWhere((s) => norm(s.name) == k, orElse: () => MStat(name));
+    final jobs = S.byMonth(S.isler, m).where((r) => norm(r['makina'] ?? '') == k).toList()..sort(cmpDate);
+    final fuel = S.byMonth(S.mazot, m).where((r) => r['tur'] == 'cikan' && norm(r['makina'] ?? '') == k).toList()..sort(cmpDate);
+    return Rep(
+      'Makina - $name',
+      ['Tarih', 'Müşteri', 'Miktar', 'Birim ücret', 'Borç'],
+      [for (final r in jobs) [dshow(r['tarih']), r['musteri'] ?? '', r['miktar'] ?? '', toD(r['ucret']), borc(r)]],
+      sub: 'Dönem: ${aylar[m]} · Çalışma: ${st.active ? st.calisma : '-'} · Yakıt: ${f2(st.litre)} L · Gelir: ${tl(st.gelir, 'TL')} · Kâr: ${tl(st.kar, 'TL')}',
+      foot: ['TOPLAM', '', '', '', st.gelir],
+      money: {3, 4},
+      photo: S.foto[k],
+      extra: [
+        Rep('Yakit', ['Tarih', 'Litre'], [for (final r in fuel) [dshow(r['tarih']), toD(r['litre'])]], sub: 'Yakıt çıkışları', foot: ['TOPLAM', sum(fuel, (r) => toD(r['litre']))])
+      ],
+    );
+  }
   final l = S.makinaStat(m).where((s) => s.active).toList();
   return Rep(
     'Makina Raporu',
@@ -1045,7 +1258,8 @@ class GCfg {
   final Widget Function(List<R>) summary;
   final String Function(List<R>) monthSum;
   final void Function(BuildContext, String?) onAdd;
-  GCfg({required this.title, required this.selLabel, required this.items, required this.keyOf, required this.allKeys, required this.sorts, required this.card, required this.rec, required this.summary, required this.monthSum, required this.onAdd});
+  final bool month;
+  GCfg({this.month = true, required this.title, required this.selLabel, required this.items, required this.keyOf, required this.allKeys, required this.sorts, required this.card, required this.rec, required this.summary, required this.monthSum, required this.onAdd});
 }
 
 List<Widget> detailRows(BuildContext c, GCfg cfg, List<R> l) {
@@ -1104,7 +1318,7 @@ class _GVState extends State<GroupView> {
           }
         }
         return Scaffold(
-          appBar: AppBar(title: Text(cfg.title), actions: const [AyDrop()]),
+          appBar: AppBar(title: Text(cfg.title), actions: cfg.month ? const [AyDrop()] : const []),
           body: Column(children: [
             Padding(padding: const EdgeInsets.fromLTRB(12, 10, 12, 6), child: searchBox((v) => setState(() => q = v), 'Ara…')),
             Padding(
@@ -1171,7 +1385,7 @@ class GroupDetailPage extends StatelessWidget {
       builder: (c, _) {
         final l = cfg.items().where((r) => norm(cfg.keyOf(r)) == norm(keyName)).toList();
         return Scaffold(
-          appBar: AppBar(title: Text(keyName, overflow: TextOverflow.ellipsis), actions: const [AyDrop()]),
+          appBar: AppBar(title: Text(keyName, overflow: TextOverflow.ellipsis), actions: cfg.month ? const [AyDrop()] : const []),
           body: ListView(padding: const EdgeInsets.fromLTRB(12, 10, 12, 90), children: [
             cfg.summary(l),
             const SizedBox(height: 4),
@@ -1349,7 +1563,7 @@ class MazotTab extends StatelessWidget {
       return Box(
         onTap: () => push(c, GroupDetailPage(cfg, g.key)),
         child: Row(children: [
-          Avatar(g.key, icon: g.key == 'Depo girişleri' ? Icons.archive_outlined : (g.key == 'Dışarıdan alımlar' ? Icons.shopping_cart_outlined : Icons.local_gas_station)),
+          if (S.foto.containsKey(norm(g.key))) MAvatar(g.key) else Avatar(g.key, icon: g.key == 'Depo girişleri' ? Icons.archive_outlined : (g.key == 'Dışarıdan alımlar' ? Icons.shopping_cart_outlined : Icons.local_gas_station)),
           const SizedBox(width: 12),
           Expanded(
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -1412,7 +1626,7 @@ class _MusteriState extends State<MusteriTab> {
         final segs = ['hic', 'kismen', 'tam', if (cnt('yok') > 0) 'yok'];
         final y = S.year;
         return Scaffold(
-          appBar: AppBar(title: const Text('Müşteriler')),
+          appBar: AppBar(title: const Text('Müşteriler'), actions: [IconButton(icon: const Icon(Icons.campaign_outlined), tooltip: 'Tahsilat listesi (WhatsApp)', onPressed: () => push(c, const TahsilatPage()))]),
           body: Column(children: [
             Padding(padding: const EdgeInsets.fromLTRB(12, 10, 12, 6), child: searchBox((v) => setState(() => q = v), 'Müşteri ara…')),
             SizedBox(
@@ -1477,7 +1691,7 @@ class MusteriDetay extends StatelessWidget {
             monthSum: (x) => 'borç ${tl(sum(x, borc))} · alınan ${tl(sum(x, (r) => toD(r['alinan'])))}', onAdd: (c, k) {});
         return Scaffold(
           appBar: AppBar(title: Text(name, overflow: TextOverflow.ellipsis), actions: [
-            IconButton(icon: const Icon(Icons.ios_share), tooltip: 'Ekstre', onPressed: () => exportSheet(c, 'Ekstre - $name', (_) => repEkstre(name))),
+            IconButton(icon: const Icon(Icons.ios_share), tooltip: 'Ekstre', onPressed: () => exportSheet(c, 'Ekstre - $name', (a, b) => repEkstre(name))),
             PopupMenuButton<String>(
               onSelected: (v) async {
                 if (v == 'r') {
@@ -1488,6 +1702,7 @@ class MusteriDetay extends StatelessWidget {
                   }
                   final i = S.musteriler.indexWhere((x) => norm(x) == norm(name));
                   if (i >= 0) S.musteriler[i] = n;
+                  if (S.telefon.containsKey(norm(name))) S.telefon[norm(n)] = S.telefon.remove(norm(name))!;
                   S.commit();
                   if (c.mounted) Navigator.pop(c);
                 } else if (l.isNotEmpty) {
@@ -1521,19 +1736,36 @@ class MusteriDetay extends StatelessWidget {
             ]),
             const SizedBox(height: 10),
             if (s.kalan > 0.5 && s.oldest != null) Align(alignment: Alignment.centerLeft, child: agePill(s)),
-            const SizedBox(height: 8),
+            const SizedBox(height: 4),
+            Box(
+              pad: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              bottom: 6,
+              onTap: () async {
+                final t = await askName(c, 'Telefon (WhatsApp için)', S.telefon[norm(name)] ?? '');
+                if (t == null) return;
+                if (t.isEmpty) {
+                  S.telefon.remove(norm(name));
+                } else {
+                  S.telefon[norm(name)] = t;
+                }
+                S.commit();
+              },
+              child: Row(children: [
+                const Icon(Icons.phone, size: 18, color: grey),
+                const SizedBox(width: 8),
+                Expanded(child: Text((S.telefon[norm(name)] ?? '').isEmpty ? 'Telefon ekle (WhatsApp için)' : S.telefon[norm(name)]!, style: TextStyle(color: (S.telefon[norm(name)] ?? '').isEmpty ? grey : Colors.black87))),
+                const Icon(Icons.edit, size: 16, color: grey),
+              ]),
+            ),
             Row(children: [
               Expanded(child: FilledButton.icon(onPressed: () => editRec(c, S.isler, 'tahsilat', tahsilatFl(), defaults: {'musteri': name, 'aciklama': 'Tahsilat'}), icon: const Icon(Icons.payments), label: const Text('Tahsilat'))),
               const SizedBox(width: 8),
               Expanded(child: OutlinedButton.icon(onPressed: () => editRec(c, S.isler, 'iş', isFl(), defaults: {'musteri': name}), icon: const Icon(Icons.add), label: const Text('İş ekle'))),
               const SizedBox(width: 8),
-              IconButton.outlined(
-                tooltip: 'Hatırlatma mesajını kopyala',
-                onPressed: () {
-                  Clipboard.setData(ClipboardData(
-                      text: 'Merhaba $name, ${s.oldest != null ? '${dshow(s.oldest)} tarihli işlerimizden başlayarak ' : ''}toplam ${tl(s.kalan)} bakiyeniz bulunmaktadır. Müsait olduğunuzda ödemenizi rica ederiz. Teşekkürler.'));
-                  msg(c, 'Hatırlatma mesajı kopyalandı, WhatsApp\'a yapıştırabilirsiniz.');
-                },
+              IconButton.filled(
+                style: IconButton.styleFrom(backgroundColor: const Color(0xFF25D366)),
+                tooltip: 'WhatsApp ile hatırlat',
+                onPressed: () => whatsapp(c, S.telefon[norm(name)], hatirlat(s)),
                 icon: const Icon(Icons.chat),
               ),
             ]),
@@ -1558,7 +1790,7 @@ class MakinaTab extends StatelessWidget {
               Box(
                 onTap: () => push(c, MakinaDetay(s.name)),
                 child: Row(children: [
-                  Avatar(s.name, icon: Icons.precision_manufacturing),
+                  MAvatar(s.name),
                   const SizedBox(width: 12),
                   Expanded(
                     child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -1613,11 +1845,12 @@ class MakinaDetay extends StatelessWidget {
                 if (v == 'r') {
                   final n = await askName(c, 'Makina adı', name);
                   if (n == null || n.isEmpty) return;
-                  for (final r in [...S.isler, ...S.mazot]) {
+                  for (final r in [...S.isler, ...S.mazot, ...S.bakim]) {
                     if (norm(r['makina'] ?? '') == k) r['makina'] = n;
                   }
                   final i = S.makinalar.indexWhere((e) => norm(e) == k);
                   if (i >= 0) S.makinalar[i] = n;
+                  if (S.foto.containsKey(k)) S.foto[norm(n)] = S.foto.remove(k)!;
                   S.commit();
                   if (c.mounted) Navigator.pop(c);
                 } else {
@@ -1630,6 +1863,7 @@ class MakinaDetay extends StatelessWidget {
             ),
           ]),
           body: ListView(padding: const EdgeInsets.fromLTRB(12, 12, 12, 90), children: [
+            machinePhoto(c, name),
             GridView.count(
               shrinkWrap: true,
               physics: const NeverScrollableScrollPhysics(),
@@ -1724,6 +1958,7 @@ class OzetTab extends StatelessWidget {
             PopupMenuButton<String>(
               onSelected: (v) => _menu(c, v),
               itemBuilder: (_) => const [
+                PopupMenuItem(value: 'a', child: Text('Ayarlar (firma, logo)')),
                 PopupMenuItem(value: 'b', child: Text('Yedeği panoya kopyala')),
                 PopupMenuItem(value: 'r', child: Text('Panodaki yedeği geri yükle')),
                 PopupMenuItem(value: 'x', child: Text('Excel verisine sıfırla')),
@@ -1731,6 +1966,7 @@ class OzetTab extends StatelessWidget {
             ),
           ]),
           body: ListView(padding: const EdgeInsets.all(12), children: [
+            bakimBanner(),
             GridView.count(
               shrinkWrap: true,
               physics: const NeverScrollableScrollPhysics(),
@@ -1764,11 +2000,13 @@ class OzetTab extends StatelessWidget {
                         style: FilledButton.styleFrom(backgroundColor: amber, foregroundColor: Colors.white, minimumSize: const Size(0, 70), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14))),
                         onPressed: () {
                           if (e[1] == 'm') {
-                            exportSheet(c, 'Müşteri raporu', repMusteri, scopes: const ['Tüm müşteriler', 'Sadece borçlular']);
+                            exportSheet(c, 'Müşteri raporu', (sc, sel) => sel == null ? repMusteri(sc) : repEkstre(sel),
+                                scopes: const ['Tüm müşteriler', 'Sadece borçlular'], selLabel: 'Müşteri seç', selOptions: () => ([...S.musteriler]..sort((a, b) => norm(a).compareTo(norm(b)))), musteri: true);
                           } else if (e[1] == 'g') {
-                            exportSheet(c, 'Gider raporu (${aylar[m]})', (_) => repGider(m));
+                            exportSheet(c, 'Gider raporu (${aylar[m]})', (sc, sel) => repGider(m, sel),
+                                selLabel: 'Gider kalemi seç', selOptions: () => ({...S.giderler.map((e) => (e['kalem'] ?? '').trim())}.where((e) => e.isNotEmpty).toList()..sort((a, b) => norm(a).compareTo(norm(b)))));
                           } else {
-                            exportSheet(c, 'Makina raporu (${aylar[m]})', (_) => repMakina(m));
+                            exportSheet(c, 'Makina raporu (${aylar[m]})', (sc, sel) => repMakina(m, sel), selLabel: 'Makina seç', selOptions: () => [...S.makinalar]);
                           }
                         },
                         child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [Icon(e[2] as IconData, size: 20), const SizedBox(height: 4), Text(e[0] as String, textAlign: TextAlign.center, style: const TextStyle(fontSize: 12))]),
@@ -1849,7 +2087,9 @@ class OzetTab extends StatelessWidget {
       });
 
   Future<void> _menu(BuildContext c, String v) async {
-    if (v == 'b') {
+    if (v == 'a') {
+      push(c, const AyarPage());
+    } else if (v == 'b') {
       await Clipboard.setData(ClipboardData(text: S.export()));
       if (c.mounted) msg(c, 'Yedek panoya kopyalandı. Bir yere yapıştırıp saklayın.');
     } else if (v == 'r') {
@@ -1866,4 +2106,366 @@ class OzetTab extends StatelessWidget {
       if (ok == true) await S.reset();
     }
   }
+}
+
+// ============================ FOTOĞRAF / WHATSAPP ============================
+Future<String?> pickPhoto(BuildContext c, String key) async {
+  final src = await showModalBottomSheet<ImageSource>(
+      context: c,
+      builder: (x) => SafeArea(
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              ListTile(leading: const Icon(Icons.photo_library), title: const Text('Galeriden seç'), onTap: () => Navigator.pop(x, ImageSource.gallery)),
+              ListTile(leading: const Icon(Icons.photo_camera), title: const Text('Kamera ile çek'), onTap: () => Navigator.pop(x, ImageSource.camera)),
+            ]),
+          ));
+  if (src == null) return null;
+  try {
+    final img = await ImagePicker().pickImage(source: src, maxWidth: 1400, imageQuality: 85);
+    if (img == null) return null;
+    final dir = await getApplicationDocumentsDirectory();
+    final d = Directory('${dir.path}/fotolar');
+    if (!await d.exists()) await d.create(recursive: true);
+    final dest = '${d.path}/${key.replaceAll(RegExp(r'[^a-z0-9]'), '')}_${DateTime.now().millisecondsSinceEpoch}.jpg';
+    await File(img.path).copy(dest);
+    return dest;
+  } catch (e) {
+    if (c.mounted) msg(c, 'Fotoğraf alınamadı: $e');
+    return null;
+  }
+}
+
+class MAvatar extends StatelessWidget {
+  final String name;
+  const MAvatar(this.name, {super.key});
+  @override
+  Widget build(BuildContext context) {
+    final p = S.foto[norm(name)];
+    if (p != null && File(p).existsSync()) return CircleAvatar(radius: 22, backgroundImage: FileImage(File(p)));
+    return Avatar(name, icon: Icons.precision_manufacturing);
+  }
+}
+
+Widget machinePhoto(BuildContext c, String name) {
+  final k = norm(name);
+  final p = S.foto[k];
+  final has = p != null && File(p).existsSync();
+  return GestureDetector(
+    onTap: () => showModalBottomSheet(
+        context: c,
+        builder: (x) => SafeArea(
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                ListTile(
+                    leading: const Icon(Icons.add_a_photo),
+                    title: Text(has ? 'Fotoğrafı değiştir' : 'Fotoğraf ekle'),
+                    onTap: () async {
+                      Navigator.pop(x);
+                      final f = await pickPhoto(c, k);
+                      if (f != null) {
+                        S.foto[k] = f;
+                        S.commit();
+                      }
+                    }),
+                if (has)
+                  ListTile(
+                      leading: const Icon(Icons.delete_outline, color: red),
+                      title: const Text('Fotoğrafı kaldır'),
+                      onTap: () {
+                        Navigator.pop(x);
+                        S.foto.remove(k);
+                        S.commit();
+                      }),
+              ]),
+            )),
+    child: Container(
+      height: 180,
+      margin: const EdgeInsets.only(bottom: 10),
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16), border: Border.all(color: line)),
+      child: has
+          ? Stack(fit: StackFit.expand, children: [
+              Image.file(File(p), fit: BoxFit.cover),
+              const Positioned(right: 8, bottom: 8, child: CircleAvatar(backgroundColor: Colors.black54, child: Icon(Icons.edit, color: Colors.white))),
+            ])
+          : const Center(
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+              Icon(Icons.add_a_photo_outlined, size: 40, color: grey),
+              SizedBox(height: 6),
+              Text('Makina fotoğrafı ekle', style: TextStyle(color: grey)),
+            ])),
+    ),
+  );
+}
+
+Future<void> whatsapp(BuildContext c, String? phone, String text) async {
+  var p = (phone ?? '').replaceAll(RegExp(r'[^0-9]'), '');
+  if (p.startsWith('00')) {
+    p = p.substring(2);
+  } else if (p.startsWith('0')) {
+    p = '90${p.substring(1)}';
+  } else if (p.length == 10) {
+    p = '90$p';
+  }
+  final uri = Uri.parse('https://wa.me/$p?text=${Uri.encodeComponent(text)}');
+  try {
+    final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    if (!ok && c.mounted) msg(c, 'WhatsApp açılamadı.');
+  } catch (_) {
+    if (c.mounted) msg(c, 'WhatsApp açılamadı.');
+  }
+}
+
+String hatirlat(CStat s) {
+  final f = S.ayar['firma'] ?? '';
+  return 'Merhaba ${s.name}, ${s.oldest != null ? '${dshow(s.oldest)} tarihli işlerimizden başlayarak ' : ''}toplam ${tl(s.kalan)} bakiyeniz bulunmaktadır. Müsait olduğunuzda ödemenizi rica ederiz. Teşekkürler.${f.isEmpty ? '' : '\n$f'}';
+}
+
+class TahsilatPage extends StatelessWidget {
+  const TahsilatPage({super.key});
+  @override
+  Widget build(BuildContext context) => ListenableBuilder(
+      listenable: S,
+      builder: (c, _) {
+        final l = S.cust.values.where((s) => s.kalan > 0.5).toList()
+          ..sort((a, b) {
+            final x = a.oldest, y = b.oldest;
+            if (x == null && y == null) return 0;
+            if (x == null) return 1;
+            if (y == null) return -1;
+            return x.compareTo(y);
+          });
+        return Scaffold(
+          appBar: AppBar(title: Text('Tahsilat listesi (${l.length})')),
+          body: ListView(padding: const EdgeInsets.all(12), children: [
+            const Padding(
+              padding: EdgeInsets.fromLTRB(4, 0, 4, 10),
+              child: Text('Ödemesi en uzun süredir bekleyenler üstte. Yeşil WhatsApp düğmesi, hazır hatırlatma mesajını açar. Telefon kayıtlı değilse kişiyi WhatsApp\'ta siz seçersiniz.', style: TextStyle(color: grey, fontSize: 12.5)),
+            ),
+            for (final s in l)
+              Box(
+                onTap: () => push(c, MusteriDetay(s.name)),
+                child: Row(children: [
+                  Avatar(s.name),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Text(s.name, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w700)),
+                      Text('${tl(s.kalan)} · ${(S.telefon[norm(s.name)] ?? '').isEmpty ? 'telefon yok' : S.telefon[norm(s.name)]}', style: const TextStyle(fontSize: 12, color: grey)),
+                      const SizedBox(height: 4),
+                      agePill(s),
+                    ]),
+                  ),
+                  IconButton.filled(
+                    style: IconButton.styleFrom(backgroundColor: const Color(0xFF25D366)),
+                    onPressed: () => whatsapp(c, S.telefon[norm(s.name)], hatirlat(s)),
+                    icon: const Icon(Icons.chat),
+                  ),
+                ]),
+              ),
+          ]),
+        );
+      });
+}
+
+// ============================ AYARLAR (FİRMA / LOGO) ============================
+class AyarPage extends StatefulWidget {
+  const AyarPage({super.key});
+  @override
+  State<AyarPage> createState() => _AyarState();
+}
+
+class _AyarState extends State<AyarPage> {
+  late final firma = TextEditingController(text: S.ayar['firma'] ?? '');
+  late final tel = TextEditingController(text: S.ayar['tel'] ?? '');
+  late bool filigran = S.ayar['filigran'] == '1';
+  String? logo = S.ayar['logo'];
+
+  @override
+  Widget build(BuildContext context) {
+    final has = logo != null && File(logo!).existsSync();
+    return Scaffold(
+      appBar: AppBar(title: const Text('Ayarlar')),
+      body: ListView(padding: const EdgeInsets.all(16), children: [
+        const Text('Bu bilgiler PDF raporlarının başlığında ve altında görünür.', style: TextStyle(color: grey)),
+        const SizedBox(height: 12),
+        GestureDetector(
+          onTap: () async {
+            final f = await pickPhoto(context, 'logo');
+            if (f != null) setState(() => logo = f);
+          },
+          child: Container(
+            height: 130,
+            clipBehavior: Clip.antiAlias,
+            decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16), border: Border.all(color: line)),
+            child: has
+                ? Padding(padding: const EdgeInsets.all(10), child: Image.file(File(logo!), fit: BoxFit.contain))
+                : const Center(child: Column(mainAxisSize: MainAxisSize.min, children: [Icon(Icons.add_photo_alternate_outlined, size: 40, color: grey), SizedBox(height: 6), Text('Logo / fotoğraf ekle', style: TextStyle(color: grey))])),
+          ),
+        ),
+        if (has) Align(alignment: Alignment.centerRight, child: TextButton(onPressed: () => setState(() => logo = null), child: const Text('Logoyu kaldır'))),
+        const SizedBox(height: 12),
+        TextField(controller: firma, decoration: const InputDecoration(labelText: 'Firma adı', border: OutlineInputBorder())),
+        const SizedBox(height: 12),
+        TextField(controller: tel, keyboardType: TextInputType.phone, decoration: const InputDecoration(labelText: 'Telefon', border: OutlineInputBorder())),
+        SwitchListTile(contentPadding: EdgeInsets.zero, title: const Text('Logoyu PDF arka planına silik (filigran) koy'), value: filigran, onChanged: (v) => setState(() => filigran = v)),
+        const SizedBox(height: 8),
+        FilledButton(
+          onPressed: () {
+            S.ayar['firma'] = firma.text.trim();
+            S.ayar['tel'] = tel.text.trim();
+            S.ayar['filigran'] = filigran ? '1' : '0';
+            if (logo == null) {
+              S.ayar.remove('logo');
+            } else {
+              S.ayar['logo'] = logo!;
+            }
+            S.commit();
+            Navigator.pop(context);
+          },
+          child: const Text('Kaydet'),
+        ),
+      ]),
+    );
+  }
+}
+
+// ============================ BAKIM & SERVİS ============================
+List<Fld> bakimFl() => [
+      Fld('makina', 'Makina / araç', 'p', S.makinalar),
+      const Fld('tur', 'Bakım türü', 'p', ['Yağ değişimi', 'Yağ filtresi', 'Hava filtresi', 'Yakıt filtresi', 'Hidrolik yağ', 'Gres / yağlama', 'Genel bakım', 'Lastik', 'Fren', 'Akü', 'Diğer']),
+      const Fld('tarih', 'Bakım tarihi', 'd'),
+      const Fld('saat', 'Bakım saati (örn. 14:30)'),
+      const Fld('sayac', 'Motor saati / sayaç (ops.)', 'n'),
+      const Fld('aralik', 'Sonraki bakım kaç ÇALIŞMA SAATİ sonra', 'n'),
+      const Fld('gun', 'veya kaç GÜN sonra (ops.)', 'n'),
+      const Fld('tutar', 'Maliyet ₺ (ops.)', 'n'),
+      const Fld('aciklama', 'Açıklama', 'm'),
+    ];
+
+Widget bakimRec(BuildContext c, R r) {
+  final ar = toD(r['aralik']), gn = toD(r['gun']);
+  final bits = [
+    dshow(r['tarih']) + ((r['saat'] ?? '').isEmpty ? '' : ' ${r['saat']}'),
+    if ((r['sayac'] ?? '').isNotEmpty) 'motor ${r['sayac']} sa',
+    if (ar > 0) 'her ${f2(ar)} sa',
+    if (gn > 0) 'her ${f2(gn)} gün',
+  ];
+  return Box(
+    pad: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+    bottom: 6,
+    onTap: () => editRec(c, S.bakim, 'bakım', bakimFl(), rec: r),
+    child: Row(children: [
+      const Icon(Icons.build_circle, color: navy, size: 22),
+      const SizedBox(width: 10),
+      Expanded(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('${r['tur'] ?? 'Bakım'} · ${r['makina'] ?? ''}', style: const TextStyle(fontWeight: FontWeight.w600)),
+          Text(bits.join(' · ') + ((r['aciklama'] ?? '').isEmpty ? '' : '\n${r['aciklama']}'), style: const TextStyle(fontSize: 12, color: grey)),
+        ]),
+      ),
+      if (toD(r['tutar']) > 0) Text(tl(toD(r['tutar'])), style: const TextStyle(fontWeight: FontWeight.w700)),
+    ]),
+  );
+}
+
+Widget bakimCard(BuildContext c, BStat b) {
+  final col = b.durum == 'gec' ? red : (b.durum == 'yakin' ? orange : (b.durum == 'ok' ? green : grey));
+  final lab = b.durum == 'gec' ? 'GECİKTİ' : (b.durum == 'yakin' ? 'YAKLAŞIYOR' : (b.durum == 'ok' ? 'Zamanı var' : 'Hatırlatma yok'));
+  final r = b.r;
+  final ks = b.kalanSaat, kg = b.kalanGun;
+  final lines = <String>[
+    'Son bakım: ${dshow(r['tarih'])}${(r['saat'] ?? '').isEmpty ? '' : ' ${r['saat']}'}${(r['sayac'] ?? '').isEmpty ? '' : ' · motor ${r['sayac']} sa'}',
+    if (ks != null) 'Çalışma: ${f2(b.worked)} / ${f2(b.aralik)} sa · ${ks <= 0 ? '${f2(-ks)} sa geçti' : 'kalan ${f2(ks)} sa'}',
+    if (kg != null) 'Süre: ${b.days} / ${f2(b.gun)} gün · ${kg <= 0 ? '${-kg} gün geçti' : 'kalan $kg gün'}',
+    if (ks != null && toD(r['sayac']) > 0) 'Sonraki bakım: motor ${f2(toD(r['sayac']) + b.aralik)} sa',
+  ];
+  return Box(
+    border: (b.durum == 'gec' || b.durum == 'yakin') ? col : null,
+    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        MAvatar(b.makina),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(b.tur, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+            Text(b.makina, style: const TextStyle(fontSize: 12, color: grey)),
+          ]),
+        ),
+        Pill(lab, col),
+      ]),
+      if (b.durum != 'bilgi') ...[
+        const SizedBox(height: 10),
+        ClipRRect(borderRadius: BorderRadius.circular(6), child: LinearProgressIndicator(value: b.ratio, color: col, backgroundColor: line, minHeight: 7)),
+      ],
+      const SizedBox(height: 8),
+      for (final t in lines) Text(t, style: const TextStyle(fontSize: 12.5, color: Colors.black87)),
+      Align(
+        alignment: Alignment.centerRight,
+        child: TextButton.icon(
+          onPressed: () => editRec(c, S.bakim, 'bakım', bakimFl(), defaults: {'makina': b.makina, 'tur': b.tur, 'aralik': r['aralik'] ?? '', 'gun': r['gun'] ?? '', 'saat': nowHm()}),
+          icon: const Icon(Icons.check_circle_outline),
+          label: const Text('Bakımı yaptım – yenile'),
+        ),
+      ),
+    ]),
+  );
+}
+
+Widget bakimBanner() {
+  final l = S.bakimDurum;
+  final g = l.where((b) => b.durum == 'gec').length, y = l.where((b) => b.durum == 'yakin').length;
+  if (g + y == 0) return const SizedBox();
+  return Box(
+    color: const Color(0xFFFFF1F0),
+    border: red,
+    onTap: () => goTab?.call(5),
+    child: Row(children: [
+      const Icon(Icons.build_circle, color: red),
+      const SizedBox(width: 10),
+      Expanded(child: Text('Bakım hatırlatması: $g gecikmiş, $y yaklaşan. Görmek için dokunun.', style: const TextStyle(fontWeight: FontWeight.w600))),
+      const Icon(Icons.chevron_right, color: grey),
+    ]),
+  );
+}
+
+class BakimTab extends StatelessWidget {
+  BakimTab({super.key});
+  late final GCfg cfg = GCfg(
+    month: false,
+    title: 'Bakım & Servis',
+    selLabel: 'Makina seç',
+    items: () => S.bakim.toList(),
+    keyOf: (r) => r['makina'] ?? '',
+    allKeys: () => [...S.makinalar],
+    sorts: [
+      SortOpt('Son bakım', (a, b) => b.last.compareTo(a.last)),
+      SortOpt('A–Z', (a, b) => norm(a.key).compareTo(norm(b.key))),
+    ],
+    card: (c, g) => Box(
+      onTap: () => push(c, GroupDetailPage(cfg, g.key)),
+      child: Row(children: [
+        MAvatar(g.key),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(g.key, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+            Text('${g.l.length} bakım kaydı · son: ${dshow(g.last)}', style: const TextStyle(fontSize: 12, color: grey)),
+          ]),
+        ),
+        const Icon(Icons.chevron_right, color: grey),
+      ]),
+    ),
+    rec: bakimRec,
+    summary: (l) => Builder(builder: (c) {
+      final names = {...l.map((r) => norm(r['makina'] ?? ''))};
+      final bs = S.bakimDurum.where((b) => names.contains(norm(b.makina))).toList();
+      if (bs.isEmpty) {
+        return const Box(child: Text('Henüz bakım kaydı yok. + ile ilk bakımı ekleyin. "Kaç saat sonra" bilgisini girerseniz hatırlatma otomatik çalışır.', style: TextStyle(color: grey)));
+      }
+      return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [secTitle('Hatırlatmalar'), for (final b in bs) bakimCard(c, b), secTitle('Bakım geçmişi')]);
+    }),
+    monthSum: (l) => tl(sum(l, (r) => toD(r['tutar']))),
+    onAdd: (c, k) => editRec(c, S.bakim, 'bakım', bakimFl(), defaults: {'saat': nowHm(), if (k != null) 'makina': k}),
+  );
+  @override
+  Widget build(BuildContext context) => GroupView(cfg);
 }
