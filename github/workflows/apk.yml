@@ -22,6 +22,10 @@ jobs:
           rm -rf build_app/lib build_app/assets
           cp -r lib build_app/lib
           cp -r assets build_app/assets
+          for d in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+            cp android_icons/mipmap-$d/ic_launcher.png build_app/android/app/src/main/res/mipmap-$d/ic_launcher.png
+          done
+          rm -rf build_app/android/app/src/main/res/mipmap-anydpi-v26
           sed -i 's/android:label="[^"]*"/android:label="İş Takip"/' build_app/android/app/src/main/AndroidManifest.xml
       - name: APK derle
         working-directory: build_app
