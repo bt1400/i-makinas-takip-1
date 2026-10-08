@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io' show Directory, File;
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
@@ -135,7 +136,8 @@ class Store extends ChangeNotifier {
   List<R> isler = [], giderler = [], mazot = [];
   List<String> musteriler = [], makinalar = [];
   List<R> bakim = [];
-  Map<String, String> telefon = {}, foto = {}, ayar = {};
+  Map<String, String> telefon = {}, foto = {}, ayar = {}, gKat = {}, mKat = {}, renk = {};
+  List<String> gKatList = [], mKatList = [];
   late File _f;
   Map<String, CStat>? _cs;
   List<CStat>? _top;
@@ -168,9 +170,14 @@ class Store extends ChangeNotifier {
     telefon = lm('telefon');
     foto = lm('foto');
     ayar = lm('ayar');
+    gKat = lm('gkat');
+    mKat = lm('mkat');
+    renk = lm('renk');
+    gKatList = List<String>.from(j['gkatl'] ?? []);
+    mKatList = List<String>.from(j['mkatl'] ?? []);
   }
 
-  String export() => jsonEncode({'isler': isler, 'giderler': giderler, 'mazot': mazot, 'musteriler': musteriler, 'makinalar': makinalar, 'bakim': bakim, 'telefon': telefon, 'foto': foto, 'ayar': ayar});
+  String export() => jsonEncode({'isler': isler, 'giderler': giderler, 'mazot': mazot, 'musteriler': musteriler, 'makinalar': makinalar, 'bakim': bakim, 'telefon': telefon, 'foto': foto, 'ayar': ayar, 'gkat': gKat, 'mkat': mKat, 'renk': renk, 'gkatl': gKatList, 'mkatl': mKatList});
   void commit() {
     _cs = null;
     _top = null;
@@ -178,15 +185,15 @@ class Store extends ChangeNotifier {
     _f.writeAsString(export());
   }
 
-  Future<void> reset() async {
-    final b = bakim, t = telefon, f = foto, a = ayar;
-    _parse(await rootBundle.loadString('assets/data.json'));
-    bakim = b;
-    telefon = t;
-    foto = f;
-    ayar = a;
+  Future<void> loadFrom(String asset) async {
+    final a = Map<String, String>.from(ayar);
+    _parse(await rootBundle.loadString(asset));
+    if (a.isNotEmpty) ayar = a;
     commit();
   }
+
+  Future<void> reset() => loadFrom('assets/excel_data.json');
+  Future<void> clearAll() => loadFrom('assets/data.json');
 
   bool restore(String raw) {
     try {
@@ -316,6 +323,35 @@ class Store extends ChangeNotifier {
     return out;
   }
 
+  int get alacakGun => int.tryParse(ayar['gec_gun'] ?? '') ?? 180;
+  List<CStat> get gecAlacak => cust.values.where((s) => s.kalan > 0.5 && s.oldest != null && daysSince(s.oldest) >= alacakGun).toList()..sort((a, b) => a.oldest!.compareTo(b.oldest!));
+  String gCat(String kalem) => gKat[norm(kalem)] ?? '';
+  String mCat(String name) => mKat[norm(name)] ?? '';
+
+  // Alacak yaşlandırma (en eski işten başlayarak ödeme düşülür): 0-30, 31-90, 91-180, 180+ gün
+  List<double> get aging {
+    final b = [0.0, 0.0, 0.0, 0.0];
+    final byC = <String, List<R>>{};
+    for (final r in isler) {
+      (byC[norm(r['musteri'] ?? '')] ??= []).add(r);
+    }
+    byC.forEach((k, l) {
+      l.sort(cmpDate);
+      var paid = sum(l, (r) => toD(r['alinan']));
+      for (final r in l) {
+        final x = borc(r);
+        if (x <= 0) continue;
+        final un = paid >= x ? 0.0 : x - paid;
+        paid = paid >= x ? paid - x : 0.0;
+        if (un > 0.5) {
+          final d = daysSince(r['tarih']);
+          b[d <= 30 ? 0 : (d <= 90 ? 1 : (d <= 180 ? 2 : 3))] += un;
+        }
+      }
+    });
+    return b;
+  }
+
   int get dueCount => bakimDurum.where((b) => b.durum == 'gec' || b.durum == 'yakin').length;
 
   List<MStat> makinaStat(int m) {
@@ -333,8 +369,9 @@ class Store extends ChangeNotifier {
         }
         s.gelir += borc(r);
       }
-      s.litre = sum(ms.where((r) => r['tur'] == 'cikan' && norm(r['makina'] ?? '') == k), (r) => toD(r['litre']));
-      s.mazotTl = s.litre * avgPrice;
+      final mine = ms.where((r) => r['tur'] != 'giren' && norm(r['makina'] ?? '') == k);
+      s.litre = sum(mine, (r) => toD(r['litre']));
+      s.mazotTl = sum(mine, (r) => (r['tur'] == 'alim' && toD(r['tutar']) > 0) ? toD(r['tutar']) : toD(r['litre']) * avgPrice);
       out.add(s);
     }
     return out;
@@ -385,20 +422,37 @@ class _HomeState extends State<Home> {
     goTab = (v) => setState(() => i = v);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final due = S.bakimDurum.where((b) => b.durum == 'gec').toList();
-      if (due.isNotEmpty && mounted) {
+      final gec = S.gecAlacak;
+      if ((due.isNotEmpty || gec.isNotEmpty) && mounted) {
         showDialog(
             context: context,
             builder: (x) => AlertDialog(
-                  title: const Text('🔧 Bakım zamanı geldi'),
-                  content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [for (final b in due.take(8)) Text('• ${b.makina} – ${b.tur}')]),
+                  title: const Text('🔔 Hatırlatmalar'),
+                  content: SingleChildScrollView(
+                    child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      if (gec.isNotEmpty) Text('${S.alacakGun} günü geçen alacaklar (${gec.length} müşteri, ${tl(gec.fold<double>(0.0, (a, s) => a + s.kalan))})', style: const TextStyle(fontWeight: FontWeight.w700)),
+                      for (final s in gec.take(6)) Text('• ${s.name} – ${tl(s.kalan)} (${daysSince(s.oldest)} gün)'),
+                      if (gec.isNotEmpty && due.isNotEmpty) const SizedBox(height: 12),
+                      if (due.isNotEmpty) const Text('Bakımı gelen araçlar', style: TextStyle(fontWeight: FontWeight.w700)),
+                      for (final b in due.take(6)) Text('• ${b.makina} – ${b.tur}'),
+                    ]),
+                  ),
                   actions: [
                     TextButton(onPressed: () => Navigator.pop(x), child: const Text('Sonra')),
-                    FilledButton(
-                        onPressed: () {
-                          Navigator.pop(x);
-                          setState(() => i = 5);
-                        },
-                        child: const Text('Bakım sekmesi')),
+                    if (gec.isNotEmpty)
+                      TextButton(
+                          onPressed: () {
+                            Navigator.pop(x);
+                            push(context, const TahsilatPage());
+                          },
+                          child: const Text('Tahsilat listesi')),
+                    if (due.isNotEmpty)
+                      FilledButton(
+                          onPressed: () {
+                            Navigator.pop(x);
+                            setState(() => i = 5);
+                          },
+                          child: const Text('Bakım')),
                   ],
                 ));
       }
@@ -411,7 +465,7 @@ class _HomeState extends State<Home> {
         bottomNavigationBar: ListenableBuilder(
           listenable: S,
           builder: (c, _) {
-            final n = S.dueCount;
+            final n = S.dueCount, g = S.gecAlacak.length;
             return BottomNavigationBar(
               type: BottomNavigationBarType.fixed,
               currentIndex: i,
@@ -425,7 +479,10 @@ class _HomeState extends State<Home> {
                 const BottomNavigationBarItem(icon: Icon(Icons.dashboard_outlined), activeIcon: Icon(Icons.dashboard), label: 'Özet'),
                 const BottomNavigationBarItem(icon: Icon(Icons.agriculture_outlined), activeIcon: Icon(Icons.agriculture), label: 'İşler'),
                 const BottomNavigationBarItem(icon: Icon(Icons.local_gas_station_outlined), activeIcon: Icon(Icons.local_gas_station), label: 'Mazot'),
-                const BottomNavigationBarItem(icon: Icon(Icons.groups_outlined), activeIcon: Icon(Icons.groups), label: 'Müşteri'),
+                BottomNavigationBarItem(
+                    icon: Badge(isLabelVisible: g > 0, label: Text('$g'), child: const Icon(Icons.groups_outlined)),
+                    activeIcon: Badge(isLabelVisible: g > 0, label: Text('$g'), child: const Icon(Icons.groups)),
+                    label: 'Müşteri'),
                 const BottomNavigationBarItem(icon: Icon(Icons.precision_manufacturing_outlined), activeIcon: Icon(Icons.precision_manufacturing), label: 'Makina'),
                 BottomNavigationBarItem(
                     icon: Badge(isLabelVisible: n > 0, label: Text('$n'), child: const Icon(Icons.build_circle_outlined)),
@@ -532,7 +589,7 @@ Widget searchBox(ValueChanged<String> f, String hint) => TextField(
 Widget agePill(CStat s) {
   if (s.oldest == null || s.kalan <= 0.5) return const SizedBox();
   final d = daysSince(s.oldest);
-  final col = d > 60 ? red : (d > 30 ? orange : grey);
+  final col = d >= S.alacakGun ? red : (d > 60 ? orange : grey);
   return Pill('En eski ödenmemiş iş: ${dshow(s.oldest)} · $d gün', col);
 }
 
@@ -734,7 +791,7 @@ List<Fld> giderFl() => [
 List<Fld> mazotFl() => [
       const Fld('tur', 'Tür', 's', turler),
       const Fld('tarih', 'Tarih', 'd'),
-      Fld('makina', 'Makina (yakıt çıkışında)', 'p', S.makinalar),
+      Fld('makina', 'Makina (depodan çıkış / dışarıdan alımda)', 'p', S.makinalar),
       const Fld('litre', 'Litre', 'n'),
       const Fld('tutar', 'Toplam tutar ₺ (alım/girişte, ops.)', 'n'),
       const Fld('aciklama', 'Açıklama', 'm'),
@@ -778,7 +835,7 @@ Future<pw.ImageProvider?> _img(String? p) async {
   }
 }
 
-List<pw.Widget> _pdfBlock(Rep r, {pw.ImageProvider? logo, pw.ImageProvider? photo, String firm = ''}) {
+List<pw.Widget> _pdfBlock(Rep r, {pw.ImageProvider? logo, bool dark = false, pw.ImageProvider? photo, String firm = ''}) {
   final n = r.head.length;
   final w = <int, pw.TableColumnWidth>{};
   for (var i = 0; i < n; i++) {
@@ -812,8 +869,8 @@ List<pw.Widget> _pdfBlock(Rep r, {pw.ImageProvider? logo, pw.ImageProvider? phot
         if (logo != null)
           pw.Container(
             padding: const pw.EdgeInsets.all(3),
-            decoration: const pw.BoxDecoration(color: PdfColors.white, borderRadius: pw.BorderRadius.all(pw.Radius.circular(4))),
-            child: pw.Image(logo, height: 34),
+            decoration: pw.BoxDecoration(color: dark ? PdfColors.black : PdfColors.white, borderRadius: const pw.BorderRadius.all(pw.Radius.circular(4))),
+            child: pw.Image(logo, height: 44),
           ),
       ]),
     ),
@@ -841,24 +898,25 @@ List<pw.Widget> _pdfBlock(Rep r, {pw.ImageProvider? logo, pw.ImageProvider? phot
 Future<List<int>> toPdf(Rep r) async {
   final reg = pw.Font.ttf(await rootBundle.load('assets/fonts/LiberationSans-Regular.ttf'));
   final bold = pw.Font.ttf(await rootBundle.load('assets/fonts/LiberationSans-Bold.ttf'));
-  final logo = await _img(S.ayar['logo']);
+  final lp = await loadLogo();
+  final logo = lp == null ? null : pw.MemoryImage(lp.orig);
+  final wmImg = (lp != null && S.ayar['filigran'] != '0') ? pw.MemoryImage(lp.wm) : null;
   final photo = await _img(r.photo);
   final firm = [S.ayar['firma'] ?? '', S.ayar['tel'] ?? ''].where((e) => e.isNotEmpty).join(' · ');
   final doc = pw.Document();
   final wide = r.head.length > 6 || r.extra.any((e) => e.head.length > 6);
-  final water = logo != null && S.ayar['filigran'] == '1';
   doc.addPage(pw.MultiPage(
     pageTheme: pw.PageTheme(
       pageFormat: wide ? PdfPageFormat.a4.landscape : PdfPageFormat.a4,
       margin: const pw.EdgeInsets.all(28),
       theme: pw.ThemeData.withFont(base: reg, bold: bold),
-      buildBackground: water ? (ctx) => pw.FullPage(ignoreMargins: true, child: pw.Center(child: pw.Opacity(opacity: 0.07, child: pw.Image(logo!, width: 320)))) : null,
+      buildBackground: wmImg != null ? (ctx) => pw.FullPage(ignoreMargins: true, child: pw.Center(child: pw.Image(wmImg!, width: 380))) : null,
     ),
     footer: (ctx) => pw.Row(mainAxisAlignment: pw.MainAxisAlignment.spaceBetween, children: [
       pw.Text(firm.isEmpty ? 'İş Takip · ${dshow(todayIso())}' : '$firm · ${dshow(todayIso())}', style: const pw.TextStyle(fontSize: 8, color: PdfColors.grey600)),
       pw.Text('Sayfa ${ctx.pageNumber}/${ctx.pagesCount}', style: const pw.TextStyle(fontSize: 8, color: PdfColors.grey600)),
     ]),
-    build: (ctx) => [..._pdfBlock(r, logo: logo, photo: photo, firm: firm), for (final e in r.extra) ..._pdfBlock(e, logo: logo)],
+    build: (ctx) => [..._pdfBlock(r, logo: logo, dark: lp?.dark ?? false, photo: photo, firm: firm), for (final e in r.extra) ..._pdfBlock(e, logo: logo, dark: lp?.dark ?? false)],
   ));
   return doc.save();
 }
@@ -1127,8 +1185,9 @@ class _ExportState extends State<_ExportSheet> {
 }
 
 // ---- Rapor içerikleri ----
-Rep repMusteri(int scope) {
-  final l = S.cust.values.where((s) => s.durum != 'yok' && (scope == 0 || s.kalan > 0.5)).toList()..sort((a, b) => b.kalan.compareTo(a.kalan));
+Rep repMusteri(int scope, [String? kat]) {
+  final kk = kat == 'Kategorisiz' ? '' : kat;
+  final l = S.cust.values.where((s) => s.durum != 'yok' && (scope == 0 || s.kalan > 0.5) && (kat == null || S.mCat(s.name) == kk)).toList()..sort((a, b) => b.kalan.compareTo(a.kalan));
   final names = {...l.map((s) => norm(s.name))};
   final det = S.isler.where((r) => names.contains(norm(r['musteri'] ?? ''))).toList()
     ..sort((a, b) {
@@ -1136,12 +1195,12 @@ Rep repMusteri(int scope) {
       return c != 0 ? c : cmpDate(a, b);
     });
   return Rep(
-    scope == 0 ? 'Müşteri Raporu' : 'Borçlu Müşteriler',
-    ['Müşteri', 'İş', 'Borç', 'Alınan', 'Kalan', 'Durum', 'En eski ödenmemiş'],
-    [for (final s in l) [s.name, s.n, s.borc, s.alinan, s.kalan, durumAd[s.durum]!, (s.oldest != null && s.kalan > 0.5) ? dshow(s.oldest) : '']],
+    kat != null ? 'Müşteri - $kat' : (scope == 0 ? 'Müşteri Raporu' : 'Borçlu Müşteriler'),
+    ['Müşteri', 'Kategori', 'İş', 'Borç', 'Alınan', 'Kalan', 'Durum', 'En eski ödenmemiş'],
+    [for (final s in l) [s.name, S.mCat(s.name), s.n, s.borc, s.alinan, s.kalan, durumAd[s.durum]!, (s.oldest != null && s.kalan > 0.5) ? dshow(s.oldest) : '']],
     sub: '${l.length} müşteri · Tarih: ${dshow(todayIso())}',
-    foot: ['TOPLAM', l.fold<int>(0, (a, s) => a + s.n), l.fold<double>(0.0, (a, s) => a + s.borc), l.fold<double>(0.0, (a, s) => a + s.alinan), l.fold<double>(0.0, (a, s) => a + s.kalan), '', ''],
-    money: {2, 3, 4},
+    foot: ['TOPLAM', '', l.fold<int>(0, (a, s) => a + s.n), l.fold<double>(0.0, (a, s) => a + s.borc), l.fold<double>(0.0, (a, s) => a + s.alinan), l.fold<double>(0.0, (a, s) => a + s.kalan), '', ''],
+    money: {3, 4, 5},
     extra: [
       Rep('Is detayi', ['Müşteri', 'Tarih', 'Makina', 'Miktar', 'Birim ücret', 'Borç', 'Alınan'],
           [for (final r in det) [r['musteri'] ?? '', dshow(r['tarih']), r['makina'] ?? '', r['miktar'] ?? '', toD(r['ucret']), borc(r), toD(r['alinan'])]],
@@ -1150,9 +1209,18 @@ Rep repMusteri(int scope) {
   );
 }
 
-Rep repGider(int m, [String? kalem]) {
+Rep repGider(int m, [String? sel]) {
   var l = S.byMonth(S.giderler, m);
-  if (kalem != null) l = l.where((r) => norm(r['kalem'] ?? '') == norm(kalem)).toList();
+  String? cat, kalem;
+  if (sel != null) {
+    if (sel.startsWith('Kategori: ')) {
+      cat = sel.substring(10);
+    } else {
+      kalem = sel;
+    }
+  }
+  if (kalem != null) l = l.where((r) => norm(r['kalem'] ?? '') == norm(kalem!)).toList();
+  if (cat != null) l = l.where((r) => S.gCat(r['kalem'] ?? '') == (cat == 'Kategorisiz' ? '' : cat)).toList();
   final tot = sum(l, (r) => toD(r['tutar']));
   if (kalem != null) {
     final d = [...l]..sort(cmpDate);
@@ -1164,15 +1232,24 @@ Rep repGider(int m, [String? kalem]) {
       final c = norm(a['kalem'] ?? '').compareTo(norm(b['kalem'] ?? ''));
       return c != 0 ? c : cmpDate(a, b);
     });
+  final ks = <String, double>{}, kc = <String, int>{};
+  for (final r in l) {
+    final c0 = S.gCat(r['kalem'] ?? '');
+    final c = c0.isEmpty ? 'Kategorisiz' : c0;
+    ks[c] = (ks[c] ?? 0) + toD(r['tutar']);
+    kc[c] = (kc[c] ?? 0) + 1;
+  }
+  final kl = ks.entries.toList()..sort((a, b) => b.value.compareTo(a.value));
   return Rep(
-    'Gider Raporu',
-    ['Gider kalemi / kişi', 'Kayıt', 'Toplam'],
-    [for (final x in g) [x.key, x.l.length, sum(x.l, (r) => toD(r['tutar']))]],
+    cat != null ? 'Gider - Kategori $cat' : 'Gider Raporu',
+    ['Gider kalemi / kişi', 'Kategori', 'Kayıt', 'Toplam'],
+    [for (final x in g) [x.key, S.gCat(x.key), x.l.length, sum(x.l, (r) => toD(r['tutar']))]],
     sub: 'Dönem: ${aylar[m]} · ${l.length} kayıt',
-    foot: ['TOPLAM', l.length, tot],
-    money: {2},
+    foot: ['TOPLAM', '', l.length, tot],
+    money: {3},
     extra: [
-      Rep('Gider detayi', ['Tarih', 'Kalem', 'Tutar', 'Açıklama'], [for (final r in det) [dshow(r['tarih']), r['kalem'] ?? '', toD(r['tutar']), r['aciklama'] ?? '']], sub: 'Tüm gider kayıtları', money: {2})
+      if (cat == null && S.gKatList.isNotEmpty) Rep('Kategori ozeti', ['Kategori', 'Kayıt', 'Toplam'], [for (final e in kl) [e.key, kc[e.key]!, e.value]], sub: 'Giderlerin kategorilere göre dağılımı', money: {2}),
+      Rep('Gider detayi', ['Tarih', 'Kalem', 'Tutar', 'Açıklama'], [for (final r in det) [dshow(r['tarih']), r['kalem'] ?? '', toD(r['tutar']), r['aciklama'] ?? '']], sub: 'Tüm gider kayıtları', money: {2}),
     ],
   );
 }
@@ -1182,7 +1259,7 @@ Rep repMakina(int m, [String? name]) {
     final k = norm(name);
     final st = S.makinaStat(m).firstWhere((s) => norm(s.name) == k, orElse: () => MStat(name));
     final jobs = S.byMonth(S.isler, m).where((r) => norm(r['makina'] ?? '') == k).toList()..sort(cmpDate);
-    final fuel = S.byMonth(S.mazot, m).where((r) => r['tur'] == 'cikan' && norm(r['makina'] ?? '') == k).toList()..sort(cmpDate);
+    final fuel = S.byMonth(S.mazot, m).where((r) => r['tur'] != 'giren' && norm(r['makina'] ?? '') == k).toList()..sort(cmpDate);
     return Rep(
       'Makina - $name',
       ['Tarih', 'Müşteri', 'Miktar', 'Birim ücret', 'Borç'],
@@ -1259,7 +1336,13 @@ class GCfg {
   final String Function(List<R>) monthSum;
   final void Function(BuildContext, String?) onAdd;
   final bool month;
-  GCfg({this.month = true, required this.title, required this.selLabel, required this.items, required this.keyOf, required this.allKeys, required this.sorts, required this.card, required this.rec, required this.summary, required this.monthSum, required this.onAdd});
+  final List<String> Function(R)? keysOf;
+  final List<String> Function()? cats;
+  final String Function(String)? catOf;
+  final List<Widget> Function(BuildContext)? actions;
+  final List<Widget> Function(BuildContext, String)? detailActions;
+  List<String> ks(R r) => keysOf?.call(r) ?? [keyOf(r)];
+  GCfg({this.month = true, this.keysOf, this.cats, this.catOf, this.actions, this.detailActions, required this.title, required this.selLabel, required this.items, required this.keyOf, required this.allKeys, required this.sorts, required this.card, required this.rec, required this.summary, required this.monthSum, required this.onAdd});
 }
 
 List<Widget> detailRows(BuildContext c, GCfg cfg, List<R> l) {
@@ -1287,6 +1370,19 @@ List<Widget> detailRows(BuildContext c, GCfg cfg, List<R> l) {
   return out;
 }
 
+List<Grp> groupByCfg(List<R> l, GCfg cfg) {
+  final m = <String, List<R>>{}, names = <String, String>{};
+  for (final r in l) {
+    for (final kk in cfg.ks(r)) {
+      final k = kk.trim().isEmpty ? 'Belirtilmemiş' : kk.trim();
+      final n = norm(k);
+      names.putIfAbsent(n, () => k);
+      (m[n] ??= []).add(r);
+    }
+  }
+  return [for (final e in m.entries) Grp(names[e.key]!, e.value)];
+}
+
 class GroupView extends StatefulWidget {
   final GCfg cfg;
   const GroupView(this.cfg, {super.key});
@@ -1297,7 +1393,7 @@ class GroupView extends StatefulWidget {
 class _GVState extends State<GroupView> {
   String q = '';
   int sort = 0;
-  String? sel;
+  String? sel, cat;
 
   @override
   Widget build(BuildContext context) => ListenableBuilder(
@@ -1305,20 +1401,23 @@ class _GVState extends State<GroupView> {
       builder: (c, _) {
         final cfg = widget.cfg;
         final all = cfg.items();
-        var groups = groupBy(all, cfg.keyOf);
+        var groups = groupByCfg(all, cfg);
         final k = norm(q);
         if (k.isNotEmpty) {
           groups = groups.where((g) => norm(g.key).contains(k) || g.l.any((r) => r.values.any((v) => norm(v).contains(k)) || norm(dshow(r['tarih'])).contains(k))).toList();
         }
+        if (cfg.cats != null && cat != null) {
+          groups = groups.where((g) => (cfg.catOf!(g.key).isEmpty ? '__none' : cfg.catOf!(g.key)) == cat).toList();
+        }
         groups.sort(cfg.sorts[sort].cmp);
         Grp? sg;
         if (sel != null) {
-          for (final g in groupBy(all, cfg.keyOf)) {
+          for (final g in groupByCfg(all, cfg)) {
             if (norm(g.key) == norm(sel!)) sg = g;
           }
         }
         return Scaffold(
-          appBar: AppBar(title: Text(cfg.title), actions: cfg.month ? const [AyDrop()] : const []),
+          appBar: AppBar(title: Text(cfg.title), actions: [...?cfg.actions?.call(c), if (cfg.month) const AyDrop()]),
           body: Column(children: [
             Padding(padding: const EdgeInsets.fromLTRB(12, 10, 12, 6), child: searchBox((v) => setState(() => q = v), 'Ara…')),
             Padding(
@@ -1356,6 +1455,19 @@ class _GVState extends State<GroupView> {
                     ),
                 ]),
               ),
+            if (sel == null && cfg.cats != null && cfg.cats!().isNotEmpty)
+              SizedBox(
+                height: 40,
+                child: ListView(scrollDirection: Axis.horizontal, padding: const EdgeInsets.symmetric(horizontal: 12), children: [
+                  Padding(padding: const EdgeInsets.only(right: 8), child: ChoiceChip(label: const Text('Tüm kategoriler'), selected: cat == null, onSelected: (_) => setState(() => cat = null))),
+                  for (final kt in cfg.cats!())
+                    Padding(
+                      padding: const EdgeInsets.only(right: 8),
+                      child: ChoiceChip(avatar: CircleAvatar(radius: 5, backgroundColor: katColor(kt)), label: Text(kt), selected: cat == kt, onSelected: (_) => setState(() => cat = kt)),
+                    ),
+                  Padding(padding: const EdgeInsets.only(right: 8), child: ChoiceChip(label: const Text('Kategorisiz'), selected: cat == '__none', onSelected: (_) => setState(() => cat = '__none'))),
+                ]),
+              ),
             Expanded(
               child: ListView(padding: const EdgeInsets.fromLTRB(12, 6, 12, 90), children: [
                 if (sel == null) ...[
@@ -1383,9 +1495,9 @@ class GroupDetailPage extends StatelessWidget {
   Widget build(BuildContext context) => ListenableBuilder(
       listenable: Listenable.merge([S, ayF]),
       builder: (c, _) {
-        final l = cfg.items().where((r) => norm(cfg.keyOf(r)) == norm(keyName)).toList();
+        final l = cfg.items().where((r) => cfg.ks(r).any((x) => norm(x) == norm(keyName))).toList();
         return Scaffold(
-          appBar: AppBar(title: Text(keyName, overflow: TextOverflow.ellipsis), actions: cfg.month ? const [AyDrop()] : const []),
+          appBar: AppBar(title: Text(keyName, overflow: TextOverflow.ellipsis), actions: [...?cfg.detailActions?.call(c, keyName), if (cfg.month) const AyDrop()]),
           body: ListView(padding: const EdgeInsets.fromLTRB(12, 10, 12, 90), children: [
             cfg.summary(l),
             const SizedBox(height: 4),
@@ -1473,6 +1585,7 @@ Widget musteriCard(BuildContext c, String name, {String? sub}) {
             Flexible(child: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15))),
             if (rk >= 0) const SizedBox(width: 6),
             if (rk >= 0) Pill('★ ${rk + 1}', gold),
+            if (S.mCat(name).isNotEmpty) ...[const SizedBox(width: 6), Pill(S.mCat(name), katColor(S.mCat(name)))],
           ]),
           const SizedBox(height: 2),
           Text(sub ?? 'Borç ${tl(s.borc)} · Alınan ${tl(s.alinan)}', style: const TextStyle(fontSize: 12, color: grey)),
@@ -1495,27 +1608,51 @@ class GiderTab extends StatelessWidget {
     items: () => S.byMonth(S.giderler, ayF.value).toList(),
     keyOf: (r) => r['kalem'] ?? '',
     allKeys: () => ({...S.giderler.map((e) => (e['kalem'] ?? '').trim())}.where((e) => e.isNotEmpty).toList())..sort((a, b) => norm(a).compareTo(norm(b))),
+    cats: () => S.gKatList,
+    catOf: (k) => S.gCat(k),
+    actions: (c) => [IconButton(icon: const Icon(Icons.category_outlined), tooltip: 'Kategorileri yönet', onPressed: () => push(c, const KatPage(true)))],
+    detailActions: (c, k) => [
+      IconButton(
+          icon: const Icon(Icons.label_outline),
+          tooltip: 'Kategori ata',
+          onPressed: () async {
+            final v = await pickCat(c, true, S.gCat(k));
+            if (v == null) return;
+            if (v.isEmpty) {
+              S.gKat.remove(norm(k));
+            } else {
+              S.gKat[norm(k)] = v;
+            }
+            S.commit();
+          })
+    ],
     sorts: [
       SortOpt('En yüksek tutar', (a, b) => sum(b.l, (r) => toD(r['tutar'])).compareTo(sum(a.l, (r) => toD(r['tutar'])))),
       SortOpt('En çok kayıt', (a, b) => b.l.length.compareTo(a.l.length)),
       SortOpt('Son kayıt', (a, b) => b.last.compareTo(a.last)),
       SortOpt('A–Z', (a, b) => norm(a.key).compareTo(norm(b.key))),
     ],
-    card: (c, g) => Box(
-      onTap: () => push(c, GroupDetailPage(cfg, g.key)),
-      child: Row(children: [
-        Avatar(g.key),
-        const SizedBox(width: 12),
-        Expanded(
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(g.key, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
-            Text('${g.l.length} kayıt · son: ${dshow(g.last)}', style: const TextStyle(fontSize: 12, color: grey)),
-          ]),
-        ),
-        Text(tl(sum(g.l, (r) => toD(r['tutar']))), style: const TextStyle(fontWeight: FontWeight.w700, color: red)),
-        const Icon(Icons.chevron_right, color: grey),
-      ]),
-    ),
+    card: (c, g) {
+      final ct = S.gCat(g.key);
+      return Box(
+        onTap: () => push(c, GroupDetailPage(cfg, g.key)),
+        child: Row(children: [
+          Avatar(g.key),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                Flexible(child: Text(g.key, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15))),
+                if (ct.isNotEmpty) ...[const SizedBox(width: 6), Pill(ct, katColor(ct))],
+              ]),
+              Text('${g.l.length} kayıt · son: ${dshow(g.last)}', style: const TextStyle(fontSize: 12, color: grey)),
+            ]),
+          ),
+          Text(tl(sum(g.l, (r) => toD(r['tutar']))), style: const TextStyle(fontWeight: FontWeight.w700, color: red)),
+          const Icon(Icons.chevron_right, color: grey),
+        ]),
+      );
+    },
     rec: (c, r) => Box(
       pad: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       bottom: 6,
@@ -1541,7 +1678,12 @@ class GiderTab extends StatelessWidget {
 }
 
 // ============================ MAZOT ============================
-String mKey(R r) => r['tur'] == 'giren' ? 'Depo girişleri' : (r['tur'] == 'alim' ? 'Dışarıdan alımlar' : ((r['makina'] ?? '').trim().isEmpty ? 'Makina belirtilmemiş' : r['makina']!.trim()));
+String _mn(R r) => (r['makina'] ?? '').trim().isEmpty ? 'Makina belirtilmemiş' : r['makina']!.trim();
+String mKey(R r) => r['tur'] == 'giren' ? 'Depo girişleri' : (r['tur'] == 'alim' ? 'Dışarıdan alımlar' : _mn(r));
+// Dışarıdan alım hem "Dışarıdan alımlar" grubunda hem (makina yazıldıysa) o makinanın grubunda görünür
+List<String> mKeys(R r) => r['tur'] == 'giren'
+    ? ['Depo girişleri']
+    : (r['tur'] == 'alim' ? ['Dışarıdan alımlar', if ((r['makina'] ?? '').trim().isNotEmpty) r['makina']!.trim()] : [_mn(r)]);
 
 class MazotTab extends StatelessWidget {
   MazotTab({super.key});
@@ -1550,6 +1692,7 @@ class MazotTab extends StatelessWidget {
     selLabel: 'Makina seç',
     items: () => S.byMonth(S.mazot, ayF.value).toList(),
     keyOf: mKey,
+    keysOf: mKeys,
     allKeys: () => ['Depo girişleri', 'Dışarıdan alımlar', ...S.makinalar],
     sorts: [
       SortOpt('En çok litre', (a, b) => sum(b.l, (r) => toD(r['litre'])).compareTo(sum(a.l, (r) => toD(r['litre'])))),
@@ -1557,45 +1700,73 @@ class MazotTab extends StatelessWidget {
       SortOpt('A–Z', (a, b) => norm(a.key).compareTo(norm(b.key))),
     ],
     card: (c, g) {
+      final depoG = g.key == 'Depo girişleri', disG = g.key == 'Dışarıdan alımlar';
       final lit = sum(g.l, (r) => toD(r['litre']));
-      final out = g.l.every((r) => r['tur'] == 'cikan');
-      final tut = out ? lit * S.avgPrice : sum(g.l, (r) => toD(r['tutar']));
+      double tut, fill;
+      Color col;
+      String sub;
+      if (depoG) {
+        tut = sum(g.l, (r) => toD(r['tutar']));
+        fill = lit == 0 ? 0.0 : (S.depo / lit);
+        col = blue;
+        sub = '${g.l.length} kayıt · depoda ${f2(S.depo)} L';
+      } else if (disG) {
+        tut = sum(g.l, (r) => toD(r['tutar']));
+        fill = 0.6;
+        col = const Color(0xFF00897B);
+        sub = '${g.l.length} alım';
+      } else {
+        final dep = sum(g.l.where((r) => r['tur'] == 'cikan'), (r) => toD(r['litre']));
+        final dis = sum(g.l.where((r) => r['tur'] == 'alim'), (r) => toD(r['litre']));
+        tut = sum(g.l, (r) => (r['tur'] == 'alim' && toD(r['tutar']) > 0) ? toD(r['tutar']) : toD(r['litre']) * S.avgPrice);
+        final mx = S.makinaStat(0).fold<double>(0.0, (a, s) => s.litre > a ? s.litre : a);
+        fill = mx == 0 ? 0.0 : lit / mx;
+        col = mColor(g.key);
+        sub = '${g.l.length} kayıt · depodan ${f2(dep)} L · dışarıdan ${f2(dis)} L';
+      }
       return Box(
         onTap: () => push(c, GroupDetailPage(cfg, g.key)),
         child: Row(children: [
-          if (S.foto.containsKey(norm(g.key))) MAvatar(g.key) else Avatar(g.key, icon: g.key == 'Depo girişleri' ? Icons.archive_outlined : (g.key == 'Dışarıdan alımlar' ? Icons.shopping_cart_outlined : Icons.local_gas_station)),
+          TankIcon(col, fill),
           const SizedBox(width: 12),
           Expanded(
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Text(g.key, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
-              Text('${g.l.length} kayıt · son: ${dshow(g.last)}', style: const TextStyle(fontSize: 12, color: grey)),
+              Text(sub, style: const TextStyle(fontSize: 12, color: grey)),
             ]),
           ),
-          two('${f2(lit)} L', tut > 0 ? (out ? '≈ ${tl(tut)}' : tl(tut)) : ''),
+          two('${f2(lit)} L', tut > 0 ? ((depoG || disG) ? tl(tut) : '≈ ${tl(tut)}') : ''),
           const Icon(Icons.chevron_right, color: grey),
         ]),
       );
     },
-    rec: (c, r) => Box(
-      pad: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      bottom: 6,
-      onTap: () => editRec(c, S.mazot, 'mazot kaydı', mazotFl(), rec: r),
-      child: Row(children: [
-        Icon(r['tur'] == 'giren' ? Icons.south_west : (r['tur'] == 'alim' ? Icons.shopping_cart_outlined : Icons.north_east), color: r['tur'] == 'cikan' ? orange : green, size: 20),
-        const SizedBox(width: 10),
-        Expanded(
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(dshow(r['tarih']), style: const TextStyle(fontWeight: FontWeight.w600)),
-            Text(r['tur'] == 'giren' ? 'Depoya giriş' : (r['tur'] == 'alim' ? 'Dışarıdan alım' : 'Makinaya yakıt'), style: const TextStyle(fontSize: 12, color: grey)),
-          ]),
-        ),
-        two('${r['litre'] ?? '0'} L', toD(r['tutar']) > 0 ? tl(toD(r['tutar'])) : ''),
-      ]),
-    ),
+    rec: (c, r) {
+      final t = r['tur'], mk = (r['makina'] ?? '').trim();
+      final ic = t == 'giren' ? Icons.south_west : (t == 'alim' ? Icons.shopping_cart_outlined : Icons.north_east);
+      final cl = t == 'giren' ? green : (t == 'alim' ? const Color(0xFF00897B) : orange);
+      final lab = t == 'giren' ? 'Depoya giriş' : (t == 'alim' ? 'Dışarıdan alım${mk.isEmpty ? '' : ' · $mk'}' : 'Depodan${mk.isEmpty ? '' : ' · $mk'}');
+      return Box(
+        pad: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        bottom: 6,
+        onTap: () => editRec(c, S.mazot, 'mazot kaydı', mazotFl(), rec: r),
+        child: Row(children: [
+          Icon(ic, color: cl, size: 20),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(dshow(r['tarih']), style: const TextStyle(fontWeight: FontWeight.w600)),
+              Text(lab, style: const TextStyle(fontSize: 12, color: grey)),
+            ]),
+          ),
+          two('${r['litre'] ?? '0'} L', toD(r['tutar']) > 0 ? tl(toD(r['tutar'])) : ''),
+        ]),
+      );
+    },
     summary: (l) => _sumRow([
       two('${f2(S.depo)} L', 'Depoda (toplam)'),
-      two('${f2(sum(l.where((r) => r['tur'] == 'giren'), (r) => toD(r['litre'])))} L', 'Giren'),
-      two('${f2(sum(l.where((r) => r['tur'] == 'cikan'), (r) => toD(r['litre'])))} L', 'Çıkan'),
+      two('${f2(sum(l.where((r) => r['tur'] == 'giren'), (r) => toD(r['litre'])))} L', 'Depoya giren'),
+      two('${f2(sum(l.where((r) => r['tur'] == 'cikan'), (r) => toD(r['litre'])))} L', 'Depodan çıkan'),
+      two('${f2(sum(l.where((r) => r['tur'] == 'alim'), (r) => toD(r['litre'])))} L', 'Dışarıdan'),
     ]),
     monthSum: (l) => '${f2(sum(l, (r) => toD(r['litre'])))} L',
     onAdd: (c, k) => editRec(c, S.mazot, 'mazot kaydı', mazotFl(),
@@ -1603,6 +1774,35 @@ class MazotTab extends StatelessWidget {
   );
   @override
   Widget build(BuildContext context) => GroupView(cfg);
+}
+
+class TankIcon extends StatelessWidget {
+  final Color color;
+  final double fill;
+  const TankIcon(this.color, this.fill, {super.key});
+  @override
+  Widget build(BuildContext context) => SizedBox(width: 36, height: 44, child: CustomPaint(painter: _TankPainter(color, fill)));
+}
+
+class _TankPainter extends CustomPainter {
+  final Color c;
+  final double f;
+  _TankPainter(this.c, this.f);
+  @override
+  void paint(Canvas cv, Size s) {
+    final body = RRect.fromRectAndRadius(Rect.fromLTWH(2, 8, s.width - 4, s.height - 10), const Radius.circular(9));
+    cv.drawRRect(body, Paint()..color = c.withAlpha(40));
+    cv.save();
+    cv.clipRRect(body);
+    final h = (s.height - 10) * f.clamp(0.1, 1.0);
+    cv.drawRect(Rect.fromLTWH(2, 8 + (s.height - 10) - h, s.width - 4, h), Paint()..color = c);
+    cv.restore();
+    cv.drawRRect(body, Paint()..style = PaintingStyle.stroke..strokeWidth = 2..color = c);
+    cv.drawRRect(RRect.fromRectAndRadius(Rect.fromLTWH(s.width / 2 - 6, 0, 12, 7), const Radius.circular(3)), Paint()..color = c);
+  }
+
+  @override
+  bool shouldRepaint(covariant _TankPainter o) => o.c != c || o.f != f;
 }
 
 // ============================ MÜŞTERİ ============================
@@ -1614,11 +1814,12 @@ class MusteriTab extends StatefulWidget {
 
 class _MusteriState extends State<MusteriTab> {
   String q = '', seg = 'hic';
+  String? cat;
   @override
   Widget build(BuildContext context) => ListenableBuilder(
       listenable: S,
       builder: (c, _) {
-        final all = S.cust.values.toList();
+        final all = S.cust.values.where((s) => cat == null || (S.mCat(s.name).isEmpty ? '__none' : S.mCat(s.name)) == cat).toList();
         int cnt(String d) => all.where((s) => s.durum == d).length;
         final k = norm(q);
         final l = (k.isNotEmpty ? all.where((s) => norm(s.name).contains(k)) : all.where((s) => s.durum == seg)).toList();
@@ -1626,7 +1827,10 @@ class _MusteriState extends State<MusteriTab> {
         final segs = ['hic', 'kismen', 'tam', if (cnt('yok') > 0) 'yok'];
         final y = S.year;
         return Scaffold(
-          appBar: AppBar(title: const Text('Müşteriler'), actions: [IconButton(icon: const Icon(Icons.campaign_outlined), tooltip: 'Tahsilat listesi (WhatsApp)', onPressed: () => push(c, const TahsilatPage()))]),
+          appBar: AppBar(title: const Text('Müşteriler'), actions: [
+            IconButton(icon: const Icon(Icons.category_outlined), tooltip: 'Kategorileri yönet', onPressed: () => push(c, const KatPage(false))),
+            IconButton(icon: const Icon(Icons.campaign_outlined), tooltip: 'Tahsilat listesi (WhatsApp)', onPressed: () => push(c, const TahsilatPage())),
+          ]),
           body: Column(children: [
             Padding(padding: const EdgeInsets.fromLTRB(12, 10, 12, 6), child: searchBox((v) => setState(() => q = v), 'Müşteri ara…')),
             SizedBox(
@@ -1648,6 +1852,19 @@ class _MusteriState extends State<MusteriTab> {
                   ),
               ]),
             ),
+            if (S.mKatList.isNotEmpty)
+              SizedBox(
+                height: 40,
+                child: ListView(scrollDirection: Axis.horizontal, padding: const EdgeInsets.symmetric(horizontal: 12), children: [
+                  Padding(padding: const EdgeInsets.only(right: 8), child: ChoiceChip(label: const Text('Tüm kategoriler'), selected: cat == null, onSelected: (_) => setState(() => cat = null))),
+                  for (final kt in S.mKatList)
+                    Padding(
+                      padding: const EdgeInsets.only(right: 8),
+                      child: ChoiceChip(avatar: CircleAvatar(radius: 5, backgroundColor: katColor(kt)), label: Text(kt), selected: cat == kt, onSelected: (_) => setState(() => cat = kt)),
+                    ),
+                  Padding(padding: const EdgeInsets.only(right: 8), child: ChoiceChip(label: const Text('Kategorisiz'), selected: cat == '__none', onSelected: (_) => setState(() => cat = '__none'))),
+                ]),
+              ),
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
               child: Row(children: [
@@ -1658,7 +1875,7 @@ class _MusteriState extends State<MusteriTab> {
             ),
             Expanded(
               child: l.isEmpty
-                  ? const Center(child: Text('Bu grupta müşteri yok'))
+                  ? Center(child: Text(S.musteriler.isEmpty ? 'Henüz müşteri yok. Sağ alttaki düğmeyle ekleyin.' : 'Bu grupta müşteri yok'))
                   : ListView.builder(padding: const EdgeInsets.fromLTRB(12, 4, 12, 90), itemCount: l.length, itemBuilder: (c, i) => musteriCard(c, l[i].name)),
             ),
           ]),
@@ -1703,6 +1920,7 @@ class MusteriDetay extends StatelessWidget {
                   final i = S.musteriler.indexWhere((x) => norm(x) == norm(name));
                   if (i >= 0) S.musteriler[i] = n;
                   if (S.telefon.containsKey(norm(name))) S.telefon[norm(n)] = S.telefon.remove(norm(name))!;
+                  if (S.mKat.containsKey(norm(name))) S.mKat[norm(n)] = S.mKat.remove(norm(name))!;
                   S.commit();
                   if (c.mounted) Navigator.pop(c);
                 } else if (l.isNotEmpty) {
@@ -1757,6 +1975,26 @@ class MusteriDetay extends StatelessWidget {
                 const Icon(Icons.edit, size: 16, color: grey),
               ]),
             ),
+            Box(
+              pad: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              bottom: 6,
+              onTap: () async {
+                final v = await pickCat(c, false, S.mCat(name));
+                if (v == null) return;
+                if (v.isEmpty) {
+                  S.mKat.remove(norm(name));
+                } else {
+                  S.mKat[norm(name)] = v;
+                }
+                S.commit();
+              },
+              child: Row(children: [
+                const Icon(Icons.label_outline, size: 18, color: grey),
+                const SizedBox(width: 8),
+                Expanded(child: Text(S.mCat(name).isEmpty ? 'Kategori ata (örn. Belediye, Şahıs, Firma)' : S.mCat(name), style: TextStyle(color: S.mCat(name).isEmpty ? grey : Colors.black87))),
+                const Icon(Icons.edit, size: 16, color: grey),
+              ]),
+            ),
             Row(children: [
               Expanded(child: FilledButton.icon(onPressed: () => editRec(c, S.isler, 'tahsilat', tahsilatFl(), defaults: {'musteri': name, 'aciklama': 'Tahsilat'}), icon: const Icon(Icons.payments), label: const Text('Tahsilat'))),
               const SizedBox(width: 8),
@@ -1786,6 +2024,7 @@ class MakinaTab extends StatelessWidget {
         return Scaffold(
           appBar: AppBar(title: const Text('Makinalar'), actions: const [AyDrop()]),
           body: ListView(padding: const EdgeInsets.fromLTRB(12, 12, 12, 90), children: [
+            if (l.isEmpty) const Padding(padding: EdgeInsets.all(40), child: Center(child: Text('Henüz makina yok. Sağ alttaki + ile ekleyin.', style: TextStyle(color: grey)))),
             for (final s in l)
               Box(
                 onTap: () => push(c, MakinaDetay(s.name)),
@@ -1806,10 +2045,13 @@ class MakinaTab extends StatelessWidget {
           floatingActionButton: FloatingActionButton(
             onPressed: () async {
               final n = await askName(c, 'Yeni makina');
-              if (n != null && n.isNotEmpty && !S.makinalar.any((x) => norm(x) == norm(n))) {
-                S.makinalar.add(n);
-                S.commit();
-              }
+              if (n == null || n.isEmpty || S.makinalar.any((x) => norm(x) == norm(n))) return;
+              final idx = nextColorIdx();
+              if (!c.mounted) return;
+              final pick = await pickColor(c, idx);
+              S.makinalar.add(n);
+              S.renk[norm(n)] = '${pick ?? idx}';
+              S.commit();
             },
             child: const Icon(Icons.add),
           ),
@@ -1826,7 +2068,7 @@ class MakinaDetay extends StatelessWidget {
       builder: (c, _) {
         final k = norm(name);
         final jobs = S.byMonth(S.isler, ayF.value).where((r) => norm(r['makina'] ?? '') == k).toList();
-        final fuel = S.byMonth(S.mazot, ayF.value).where((r) => r['tur'] == 'cikan' && norm(r['makina'] ?? '') == k).toList();
+        final fuel = S.byMonth(S.mazot, ayF.value).where((r) => r['tur'] != 'giren' && norm(r['makina'] ?? '') == k).toList();
         final st = S.makinaStat(ayF.value).firstWhere((s) => norm(s.name) == k, orElse: () => MStat(name));
         final jc = GCfg(title: '', selLabel: '', items: () => jobs, keyOf: (r) => name, allKeys: () => [], sorts: [], card: (c, g) => const SizedBox(), rec: jobRec, summary: (x) => const SizedBox(), monthSum: (x) => tl(sum(x, borc)), onAdd: (c, k) {});
         final fc = GCfg(
@@ -1835,7 +2077,12 @@ class MakinaDetay extends StatelessWidget {
                   pad: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                   bottom: 6,
                   onTap: () => editRec(c, S.mazot, 'mazot kaydı', mazotFl(), rec: r),
-                  child: Row(children: [const Icon(Icons.local_gas_station, color: orange, size: 20), const SizedBox(width: 10), Expanded(child: Text(dshow(r['tarih']))), Text('${r['litre'] ?? '0'} L', style: const TextStyle(fontWeight: FontWeight.w700))]),
+                  child: Row(children: [
+                    Icon(r['tur'] == 'alim' ? Icons.shopping_cart_outlined : Icons.local_gas_station, color: r['tur'] == 'alim' ? const Color(0xFF00897B) : orange, size: 20),
+                    const SizedBox(width: 10),
+                    Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(dshow(r['tarih']), style: const TextStyle(fontWeight: FontWeight.w600)), Text(r['tur'] == 'alim' ? 'Dışarıdan alım' : 'Depodan', style: const TextStyle(fontSize: 12, color: grey))])),
+                    two('${r['litre'] ?? '0'} L', toD(r['tutar']) > 0 ? tl(toD(r['tutar'])) : ''),
+                  ]),
                 ));
         return Scaffold(
           appBar: AppBar(title: Text(name), actions: [
@@ -1851,6 +2098,8 @@ class MakinaDetay extends StatelessWidget {
                   final i = S.makinalar.indexWhere((e) => norm(e) == k);
                   if (i >= 0) S.makinalar[i] = n;
                   if (S.foto.containsKey(k)) S.foto[norm(n)] = S.foto.remove(k)!;
+                  S.renk[norm(n)] = '${mIdx(name)}';
+                  S.renk.remove(k);
                   S.commit();
                   if (c.mounted) Navigator.pop(c);
                 } else {
@@ -1864,6 +2113,22 @@ class MakinaDetay extends StatelessWidget {
           ]),
           body: ListView(padding: const EdgeInsets.fromLTRB(12, 12, 12, 90), children: [
             machinePhoto(c, name),
+            Box(
+              pad: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+              onTap: () async {
+                final i = await pickColor(c, mIdx(name));
+                if (i != null) {
+                  S.renk[k] = '$i';
+                  S.commit();
+                }
+              },
+              child: Row(children: [
+                CircleAvatar(radius: 12, backgroundColor: mColor(name)),
+                const SizedBox(width: 12),
+                const Expanded(child: Text('Makina rengi (yakıt depo simgesi ve listelerde)', style: TextStyle(fontWeight: FontWeight.w600))),
+                const Text('Değiştir', style: TextStyle(color: grey)),
+              ]),
+            ),
             GridView.count(
               shrinkWrap: true,
               physics: const NeverScrollableScrollPhysics(),
@@ -1874,11 +2139,11 @@ class MakinaDetay extends StatelessWidget {
               children: [
                 StatCard('Çalışma', st.active ? st.calisma : '-', icon: Icons.timer_outlined),
                 StatCard('Gelir', tl(st.gelir), icon: Icons.trending_up),
-                StatCard('Yakıt', '${f2(st.litre)} L', icon: Icons.local_gas_station),
+                StatCard('Yakıt (depo + dışarıdan)', '${f2(st.litre)} L', icon: Icons.local_gas_station),
                 StatCard('Kâr', tl(st.kar), color: signC(st.kar), icon: Icons.account_balance_wallet_outlined),
               ],
             ),
-            secTitle('Yakıt çıkışları'),
+            secTitle('Yakıt kayıtları (depodan + dışarıdan alım)'),
             if (fuel.isEmpty) const Padding(padding: EdgeInsets.all(12), child: Text('Kayıt yok', style: TextStyle(color: grey))),
             ...detailRows(c, fc, fuel),
             secTitle('İş kayıtları'),
@@ -1894,9 +2159,13 @@ class MakinaDetay extends StatelessWidget {
                           Navigator.pop(x);
                           editRec(c, S.isler, 'iş', isFl(), defaults: {'makina': name});
                         }),
-                        ListTile(leading: const Icon(Icons.local_gas_station), title: const Text('Yakıt çıkışı ekle'), onTap: () {
+                        ListTile(leading: const Icon(Icons.local_gas_station), title: const Text('Yakıt çıkışı ekle (depodan)'), onTap: () {
                           Navigator.pop(x);
                           editRec(c, S.mazot, 'mazot kaydı', mazotFl(), defaults: {'tur': 'cikan', 'makina': name});
+                        }),
+                        ListTile(leading: const Icon(Icons.shopping_cart_outlined), title: const Text('Dışarıdan yakıt alımı ekle'), onTap: () {
+                          Navigator.pop(x);
+                          editRec(c, S.mazot, 'mazot kaydı', mazotFl(), defaults: {'tur': 'alim', 'makina': name});
                         }),
                       ]),
                     )),
@@ -1961,12 +2230,15 @@ class OzetTab extends StatelessWidget {
                 PopupMenuItem(value: 'a', child: Text('Ayarlar (firma, logo)')),
                 PopupMenuItem(value: 'b', child: Text('Yedeği panoya kopyala')),
                 PopupMenuItem(value: 'r', child: Text('Panodaki yedeği geri yükle')),
-                PopupMenuItem(value: 'x', child: Text('Excel verisine sıfırla')),
+                PopupMenuItem(value: 'f', child: Text('Yedeği dosya olarak paylaş')),
+                PopupMenuItem(value: 'x', child: Text('Excel verisini yükle (örnek)')),
+                PopupMenuItem(value: 'e', child: Text('Tüm verileri sil (boş başla)')),
               ],
             ),
           ]),
           body: ListView(padding: const EdgeInsets.all(12), children: [
             bakimBanner(),
+            alacakBanner(),
             GridView.count(
               shrinkWrap: true,
               physics: const NeverScrollableScrollPhysics(),
@@ -2000,11 +2272,9 @@ class OzetTab extends StatelessWidget {
                         style: FilledButton.styleFrom(backgroundColor: amber, foregroundColor: Colors.white, minimumSize: const Size(0, 70), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14))),
                         onPressed: () {
                           if (e[1] == 'm') {
-                            exportSheet(c, 'Müşteri raporu', (sc, sel) => sel == null ? repMusteri(sc) : repEkstre(sel),
-                                scopes: const ['Tüm müşteriler', 'Sadece borçlular'], selLabel: 'Müşteri seç', selOptions: () => ([...S.musteriler]..sort((a, b) => norm(a).compareTo(norm(b)))), musteri: true);
+                            exportSheet(c, 'Müşteri raporu', repMusteriSel, scopes: const ['Tüm müşteriler', 'Sadece borçlular'], selLabel: 'Müşteri / kategori seç', selOptions: musteriSelOpts, musteri: true);
                           } else if (e[1] == 'g') {
-                            exportSheet(c, 'Gider raporu (${aylar[m]})', (sc, sel) => repGider(m, sel),
-                                selLabel: 'Gider kalemi seç', selOptions: () => ({...S.giderler.map((e) => (e['kalem'] ?? '').trim())}.where((e) => e.isNotEmpty).toList()..sort((a, b) => norm(a).compareTo(norm(b)))));
+                            exportSheet(c, 'Gider raporu (${aylar[m]})', (sc, sel) => repGider(m, sel), selLabel: 'Kalem / kategori seç', selOptions: giderSelOpts);
                           } else {
                             exportSheet(c, 'Makina raporu (${aylar[m]})', (sc, sel) => repMakina(m, sel), selLabel: 'Makina seç', selOptions: () => [...S.makinalar]);
                           }
@@ -2017,6 +2287,8 @@ class OzetTab extends StatelessWidget {
             ),
             secTitle('Aylık görünüm'),
             _chart(),
+            secTitle('Alacak yaşlandırma'),
+            agingCard(),
             secTitle('En çok borçlu 5 müşteri'),
             if (borclu.isEmpty) const Box(child: Text('Borçlu müşteri yok 🎉')),
             for (final s in borclu)
@@ -2066,7 +2338,7 @@ class OzetTab extends StatelessWidget {
                   rows: [
                     for (final s in ms)
                       DataRow(cells: [
-                        DataCell(Text(s.name, style: const TextStyle(fontWeight: FontWeight.w600))),
+                        DataCell(Row(children: [CircleAvatar(radius: 5, backgroundColor: mColor(s.name)), const SizedBox(width: 6), Text(s.name, style: const TextStyle(fontWeight: FontWeight.w600))])),
                         DataCell(Text(s.calisma)),
                         DataCell(Text(f2(s.litre))),
                         DataCell(Text(f2(s.lPerUnit), style: const TextStyle(fontWeight: FontWeight.bold))),
@@ -2089,6 +2361,12 @@ class OzetTab extends StatelessWidget {
   Future<void> _menu(BuildContext c, String v) async {
     if (v == 'a') {
       push(c, const AyarPage());
+    } else if (v == 'f') {
+      try {
+        await shareBytes(utf8.encode(S.export()), 'is_takip_yedek_${todayIso()}.json');
+      } catch (e) {
+        if (c.mounted) msg(c, 'Hata: $e');
+      }
     } else if (v == 'b') {
       await Clipboard.setData(ClipboardData(text: S.export()));
       if (c.mounted) msg(c, 'Yedek panoya kopyalandı. Bir yere yapıştırıp saklayın.');
@@ -2097,13 +2375,25 @@ class OzetTab extends StatelessWidget {
       final ok = S.restore(d?.text ?? '');
       if (c.mounted) msg(c, ok ? 'Yedek geri yüklendi.' : 'Panoda geçerli bir yedek yok.');
     } else {
+      final del = v == 'e';
       final ok = await showDialog<bool>(
           context: c,
-          builder: (x) => AlertDialog(title: const Text('Sıfırlansın mı?'), content: const Text('Yaptığınız tüm değişiklikler silinir, Excel\'den aktarılan ilk veri geri gelir.'), actions: [
-                TextButton(onPressed: () => Navigator.pop(x, false), child: const Text('Vazgeç')),
-                FilledButton(onPressed: () => Navigator.pop(x, true), child: const Text('Sıfırla')),
-              ]));
-      if (ok == true) await S.reset();
+          builder: (x) => AlertDialog(
+                  title: Text(del ? 'Tüm veriler silinsin mi?' : 'Excel verisi yüklensin mi?'),
+                  content: Text(del
+                      ? 'Tüm müşteri, iş, gider, mazot ve bakım kayıtları silinir; uygulama boş başlar. Bu işlem geri alınamaz.'
+                      : 'Mevcut tüm kayıtlar silinir ve Excel dosyanızdan aktarılan örnek veri yüklenir.'),
+                  actions: [
+                    TextButton(onPressed: () => Navigator.pop(x, false), child: const Text('Vazgeç')),
+                    FilledButton(onPressed: () => Navigator.pop(x, true), child: Text(del ? 'Sil' : 'Yükle')),
+                  ]));
+      if (ok == true) {
+        if (del) {
+          await S.clearAll();
+        } else {
+          await S.reset();
+        }
+      }
     }
   }
 }
@@ -2139,9 +2429,12 @@ class MAvatar extends StatelessWidget {
   const MAvatar(this.name, {super.key});
   @override
   Widget build(BuildContext context) {
+    final col = mColor(name);
     final p = S.foto[norm(name)];
-    if (p != null && File(p).existsSync()) return CircleAvatar(radius: 22, backgroundImage: FileImage(File(p)));
-    return Avatar(name, icon: Icons.precision_manufacturing);
+    if (p != null && File(p).existsSync()) {
+      return Container(padding: const EdgeInsets.all(2), decoration: BoxDecoration(shape: BoxShape.circle, color: col), child: CircleAvatar(radius: 20, backgroundImage: FileImage(File(p))));
+    }
+    return CircleAvatar(radius: 22, backgroundColor: col.withAlpha(45), child: Icon(Icons.precision_manufacturing, color: col, size: 22));
   }
 }
 
@@ -2236,12 +2529,14 @@ class TahsilatPage extends StatelessWidget {
         return Scaffold(
           appBar: AppBar(title: Text('Tahsilat listesi (${l.length})')),
           body: ListView(padding: const EdgeInsets.all(12), children: [
-            const Padding(
-              padding: EdgeInsets.fromLTRB(4, 0, 4, 10),
-              child: Text('Ödemesi en uzun süredir bekleyenler üstte. Yeşil WhatsApp düğmesi, hazır hatırlatma mesajını açar. Telefon kayıtlı değilse kişiyi WhatsApp\'ta siz seçersiniz.', style: TextStyle(color: grey, fontSize: 12.5)),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(4, 0, 4, 10),
+              child: Text('Ödemesi en uzun süredir bekleyenler üstte. ${S.alacakGun} günü geçenler kırmızı işaretlenir. Yeşil WhatsApp düğmesi hazır hatırlatma mesajını açar. Telefon kayıtlı değilse kişiyi WhatsApp\'ta siz seçersiniz.', style: const TextStyle(color: grey, fontSize: 12.5)),
             ),
+            if (l.isEmpty) const Padding(padding: EdgeInsets.all(40), child: Center(child: Text('Borçlu müşteri yok 🎉'))),
             for (final s in l)
               Box(
+                border: (s.oldest != null && daysSince(s.oldest) >= S.alacakGun) ? red : null,
                 onTap: () => push(c, MusteriDetay(s.name)),
                 child: Row(children: [
                   Avatar(s.name),
@@ -2276,36 +2571,50 @@ class AyarPage extends StatefulWidget {
 class _AyarState extends State<AyarPage> {
   late final firma = TextEditingController(text: S.ayar['firma'] ?? '');
   late final tel = TextEditingController(text: S.ayar['tel'] ?? '');
-  late bool filigran = S.ayar['filigran'] == '1';
+  late final gun = TextEditingController(text: '${S.alacakGun}');
+  late bool filigran = S.ayar['filigran'] != '0';
+  late bool noLogo = S.ayar['logo_yok'] == '1';
   String? logo = S.ayar['logo'];
 
   @override
   Widget build(BuildContext context) {
-    final has = logo != null && File(logo!).existsSync();
+    final custom = logo != null && File(logo!).existsSync();
     return Scaffold(
       appBar: AppBar(title: const Text('Ayarlar')),
       body: ListView(padding: const EdgeInsets.all(16), children: [
-        const Text('Bu bilgiler PDF raporlarının başlığında ve altında görünür.', style: TextStyle(color: grey)),
+        const Text('Logo ve firma bilgileri PDF raporlarında görünür.', style: TextStyle(color: grey)),
         const SizedBox(height: 12),
         GestureDetector(
           onTap: () async {
             final f = await pickPhoto(context, 'logo');
-            if (f != null) setState(() => logo = f);
+            if (f != null) {
+              setState(() {
+                logo = f;
+                noLogo = false;
+              });
+            }
           },
           child: Container(
-            height: 130,
+            height: 150,
             clipBehavior: Clip.antiAlias,
-            decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16), border: Border.all(color: line)),
-            child: has
-                ? Padding(padding: const EdgeInsets.all(10), child: Image.file(File(logo!), fit: BoxFit.contain))
-                : const Center(child: Column(mainAxisSize: MainAxisSize.min, children: [Icon(Icons.add_photo_alternate_outlined, size: 40, color: grey), SizedBox(height: 6), Text('Logo / fotoğraf ekle', style: TextStyle(color: grey))])),
+            decoration: BoxDecoration(color: Colors.black, borderRadius: BorderRadius.circular(16), border: Border.all(color: line)),
+            child: custom
+                ? Padding(padding: const EdgeInsets.all(8), child: Image.file(File(logo!), fit: BoxFit.contain))
+                : (noLogo
+                    ? const Center(child: Column(mainAxisSize: MainAxisSize.min, children: [Icon(Icons.add_photo_alternate_outlined, size: 40, color: Colors.white54), SizedBox(height: 6), Text('Logo ekle', style: TextStyle(color: Colors.white54))]))
+                    : Padding(padding: const EdgeInsets.all(8), child: Image.asset('assets/logo.png', fit: BoxFit.contain))),
           ),
         ),
-        if (has) Align(alignment: Alignment.centerRight, child: TextButton(onPressed: () => setState(() => logo = null), child: const Text('Logoyu kaldır'))),
-        const SizedBox(height: 12),
+        Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+          TextButton(onPressed: () => setState(() { logo = null; noLogo = false; }), child: const Text('Varsayılan logo')),
+          TextButton(onPressed: () => setState(() { logo = null; noLogo = true; }), child: const Text('Logoyu kaldır')),
+        ]),
+        const SizedBox(height: 4),
         TextField(controller: firma, decoration: const InputDecoration(labelText: 'Firma adı', border: OutlineInputBorder())),
         const SizedBox(height: 12),
         TextField(controller: tel, keyboardType: TextInputType.phone, decoration: const InputDecoration(labelText: 'Telefon', border: OutlineInputBorder())),
+        const SizedBox(height: 12),
+        TextField(controller: gun, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Ödeme hatırlatma süresi (gün)', helperText: 'Ödemesi bu kadar gündür beklenen müşteriler uyarılır (6 ay = 180)', border: OutlineInputBorder())),
         SwitchListTile(contentPadding: EdgeInsets.zero, title: const Text('Logoyu PDF arka planına silik (filigran) koy'), value: filigran, onChanged: (v) => setState(() => filigran = v)),
         const SizedBox(height: 8),
         FilledButton(
@@ -2313,6 +2622,8 @@ class _AyarState extends State<AyarPage> {
             S.ayar['firma'] = firma.text.trim();
             S.ayar['tel'] = tel.text.trim();
             S.ayar['filigran'] = filigran ? '1' : '0';
+            S.ayar['gec_gun'] = '${(int.tryParse(gun.text.trim()) ?? 180).clamp(1, 3650)}';
+            S.ayar['logo_yok'] = noLogo ? '1' : '0';
             if (logo == null) {
               S.ayar.remove('logo');
             } else {
@@ -2468,4 +2779,260 @@ class BakimTab extends StatelessWidget {
   );
   @override
   Widget build(BuildContext context) => GroupView(cfg);
+}
+
+// ============================ RENK / KATEGORİ / LOGO / UYARILAR ============================
+const palette = [
+  Color(0xFFE53935), Color(0xFF1E88E5), Color(0xFF43A047), Color(0xFFFB8C00), Color(0xFF8E24AA), Color(0xFF00ACC1), Color(0xFFD81B60), Color(0xFF6D4C41),
+  Color(0xFF3949AB), Color(0xFF7CB342), Color(0xFFF4511E), Color(0xFF00897B), Color(0xFFFDD835), Color(0xFF546E7A), Color(0xFF5E35B1), Color(0xFFC0CA33),
+];
+
+int mIdx(String name) {
+  final k = norm(name);
+  final v = int.tryParse(S.renk[k] ?? '');
+  if (v != null) return v % palette.length;
+  final i = S.makinalar.indexWhere((x) => norm(x) == k);
+  return (i < 0 ? name.runes.fold(0, (a, b) => a + b) : i) % palette.length;
+}
+
+Color mColor(String name) => palette[mIdx(name)];
+Color katColor(String cat) => palette[cat.runes.fold(0, (a, b) => a + b) % palette.length];
+
+int nextColorIdx() {
+  final used = S.makinalar.map(mIdx).toSet();
+  for (var i = 0; i < palette.length; i++) {
+    if (!used.contains(i)) return i;
+  }
+  return 0;
+}
+
+Future<int?> pickColor(BuildContext c, int cur) => showDialog<int>(
+    context: c,
+    builder: (x) => AlertDialog(
+          title: const Text('Renk seç'),
+          content: Wrap(spacing: 12, runSpacing: 12, children: [
+            for (var i = 0; i < palette.length; i++)
+              GestureDetector(
+                onTap: () => Navigator.pop(x, i),
+                child: CircleAvatar(radius: 20, backgroundColor: palette[i], child: i == cur ? const Icon(Icons.check, color: Colors.white) : null),
+              ),
+          ]),
+        ));
+
+Future<String?> pickCat(BuildContext c, bool gider, String cur) {
+  final list = gider ? S.gKatList : S.mKatList;
+  return showDialog<String>(
+      context: c,
+      builder: (x) => AlertDialog(
+            title: const Text('Kategori seç'),
+            content: SizedBox(
+              width: double.maxFinite,
+              child: ListView(shrinkWrap: true, children: [
+                ListTile(leading: const Icon(Icons.block), title: const Text('Kategorisiz'), onTap: () => Navigator.pop(x, '')),
+                for (final k in list) ListTile(leading: CircleAvatar(radius: 8, backgroundColor: katColor(k)), title: Text(k), selected: k == cur, onTap: () => Navigator.pop(x, k)),
+                ListTile(
+                    leading: const Icon(Icons.add),
+                    title: const Text('Yeni kategori ekle…'),
+                    onTap: () async {
+                      final n = await askName(c, 'Yeni kategori');
+                      if (n == null || n.isEmpty) return;
+                      if (!list.any((e) => norm(e) == norm(n))) list.add(n);
+                      if (x.mounted) Navigator.pop(x, n);
+                    }),
+              ]),
+            ),
+          ));
+}
+
+class KatPage extends StatelessWidget {
+  final bool gider;
+  const KatPage(this.gider, {super.key});
+  @override
+  Widget build(BuildContext context) => ListenableBuilder(
+      listenable: S,
+      builder: (c, _) {
+        final list = gider ? S.gKatList : S.mKatList;
+        final assign = gider ? S.gKat : S.mKat;
+        final unit = gider ? 'kalem' : 'müşteri';
+        return Scaffold(
+          appBar: AppBar(title: Text(gider ? 'Gider kategorileri' : 'Müşteri kategorileri')),
+          body: list.isEmpty
+              ? Center(
+                  child: Padding(
+                      padding: const EdgeInsets.all(32),
+                      child: Text(
+                          gider
+                              ? 'Henüz kategori yok. + ile ekleyin (örn. Personel, Yakıt, Bakım).\nSonra gider kalemlerini bu kategorilere atarsınız.'
+                              : 'Henüz kategori yok. + ile ekleyin (örn. Belediye, Şahıs, Firma).\nSonra müşteri sayfasından kategori atarsınız.',
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(color: grey))))
+              : ListView(padding: const EdgeInsets.all(12), children: [
+                  for (final k in list)
+                    Box(
+                      pad: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      bottom: 8,
+                      child: Row(children: [
+                        CircleAvatar(radius: 10, backgroundColor: katColor(k)),
+                        const SizedBox(width: 12),
+                        Expanded(child: Text(k, style: const TextStyle(fontWeight: FontWeight.w600))),
+                        Text('${assign.values.where((v) => v == k).length} $unit', style: const TextStyle(color: grey, fontSize: 12)),
+                        IconButton(
+                            icon: const Icon(Icons.edit, size: 20),
+                            onPressed: () async {
+                              final n = await askName(c, 'Kategori adı', k);
+                              if (n == null || n.isEmpty) return;
+                              final i = list.indexOf(k);
+                              if (i >= 0) list[i] = n;
+                              for (final e in assign.entries.toList()) {
+                                if (e.value == k) assign[e.key] = n;
+                              }
+                              S.commit();
+                            }),
+                        IconButton(
+                            icon: const Icon(Icons.delete_outline, size: 20, color: red),
+                            onPressed: () {
+                              list.remove(k);
+                              assign.removeWhere((a, v) => v == k);
+                              S.commit();
+                            }),
+                      ]),
+                    ),
+                ]),
+          floatingActionButton: FloatingActionButton(
+            onPressed: () async {
+              final n = await askName(c, 'Yeni kategori');
+              if (n != null && n.isNotEmpty && !list.any((x) => norm(x) == norm(n))) {
+                list.add(n);
+                S.commit();
+              }
+            },
+            child: const Icon(Icons.add),
+          ),
+        );
+      });
+}
+
+List<String> musteriSelOpts() => [
+      for (final k in S.mKatList) 'Kategori: $k',
+      if (S.mKatList.isNotEmpty) 'Kategori: Kategorisiz',
+      ...([...S.musteriler]..sort((a, b) => norm(a).compareTo(norm(b)))),
+    ];
+
+List<String> giderSelOpts() => [
+      for (final k in S.gKatList) 'Kategori: $k',
+      if (S.gKatList.isNotEmpty) 'Kategori: Kategorisiz',
+      ...({...S.giderler.map((e) => (e['kalem'] ?? '').trim())}.where((e) => e.isNotEmpty).toList()..sort((a, b) => norm(a).compareTo(norm(b)))),
+    ];
+
+Rep repMusteriSel(int sc, String? sel) => sel == null ? repMusteri(sc) : (sel.startsWith('Kategori: ') ? repMusteri(sc, sel.substring(10)) : repEkstre(sel));
+
+// Logo: kırpılır; PDF başlığı için orijinal, arka plan için saydam/silik (filigran) sürüm üretilir
+class LogoPack {
+  final Uint8List orig, wm;
+  final bool dark;
+  LogoPack(this.orig, this.wm, this.dark);
+}
+
+Future<LogoPack?> loadLogo() async {
+  try {
+    Uint8List? b;
+    final p = S.ayar['logo'];
+    if (p != null && p.isNotEmpty && File(p).existsSync()) {
+      b = await File(p).readAsBytes();
+    } else if (S.ayar['logo_yok'] != '1') {
+      final d = await rootBundle.load('assets/logo.png');
+      b = d.buffer.asUint8List(d.offsetInBytes, d.lengthInBytes);
+    }
+    if (b == null) return null;
+    final codec = await ui.instantiateImageCodec(b, targetWidth: 700);
+    final im = (await codec.getNextFrame()).image;
+    final w = im.width, h = im.height;
+    final bd = await im.toByteData(format: ui.ImageByteFormat.rawRgba);
+    var mode = 0; // 0: saydam zemin, 1: koyu zemin, 2: açık zemin
+    var x0 = w, y0 = h, x1 = 0, y1 = 0;
+    if (bd != null) {
+      final a0 = bd.getUint8(3);
+      final l0 = (bd.getUint8(0) + bd.getUint8(1) + bd.getUint8(2)) / 3;
+      if (a0 > 200) mode = l0 < 70 ? 1 : (l0 > 185 ? 2 : 0);
+      for (var y = 0; y < h; y += 2) {
+        for (var x = 0; x < w; x += 2) {
+          final o = (y * w + x) * 4;
+          final a = bd.getUint8(o + 3);
+          final l = (bd.getUint8(o) + bd.getUint8(o + 1) + bd.getUint8(o + 2)) / 3;
+          final on = a > 40 && (mode == 0 || (mode == 1 ? l > 60 : l < 195));
+          if (on) {
+            if (x < x0) x0 = x;
+            if (x > x1) x1 = x;
+            if (y < y0) y0 = y;
+            if (y > y1) y1 = y;
+          }
+        }
+      }
+    }
+    if (x1 <= x0 || y1 <= y0) {
+      x0 = 0;
+      y0 = 0;
+      x1 = w;
+      y1 = h;
+    }
+    const pad = 6;
+    final src = ui.Rect.fromLTRB((x0 - pad).clamp(0, w).toDouble(), (y0 - pad).clamp(0, h).toDouble(), (x1 + pad).clamp(0, w).toDouble(), (y1 + pad).clamp(0, h).toDouble());
+    final cw = src.width.round(), ch = src.height.round();
+    Future<Uint8List> render(ui.ColorFilter? f) async {
+      final rec = ui.PictureRecorder();
+      final cv = ui.Canvas(rec);
+      cv.drawImageRect(im, src, ui.Rect.fromLTWH(0, 0, cw.toDouble(), ch.toDouble()), ui.Paint()..colorFilter = f);
+      final out = await rec.endRecording().toImage(cw, ch);
+      final png = await out.toByteData(format: ui.ImageByteFormat.png);
+      return png!.buffer.asUint8List(png.offsetInBytes, png.lengthInBytes);
+    }
+
+    final orig = await render(null);
+    // Silik filigran: zemin tamamen şeffaf, logo çok açık gri tonunda (yazıları kapatmaz)
+    final List<double> m = mode == 1
+        ? [0, 0, 0, 0, 90, 0, 0, 0, 0, 90, 0, 0, 0, 0, 90, .04, .04, .04, 0, 0]
+        : (mode == 2 ? [0, 0, 0, 0, 90, 0, 0, 0, 0, 90, 0, 0, 0, 0, 90, -.04, -.04, -.04, 0, 31] : [0, 0, 0, 0, 90, 0, 0, 0, 0, 90, 0, 0, 0, 0, 90, 0, 0, 0, .10, 0]);
+    final wm = await render(ui.ColorFilter.matrix(m));
+    return LogoPack(orig, wm, mode == 1);
+  } catch (_) {
+    return null;
+  }
+}
+
+Widget alacakBanner() {
+  final l = S.gecAlacak;
+  if (l.isEmpty) return const SizedBox();
+  final t = l.fold<double>(0.0, (a, s) => a + s.kalan);
+  return Builder(
+      builder: (c) => Box(
+            color: const Color(0xFFFFF7ED),
+            border: orange,
+            onTap: () => push(c, const TahsilatPage()),
+            child: Row(children: [
+              const Icon(Icons.schedule, color: orange),
+              const SizedBox(width: 10),
+              Expanded(child: Text('${l.length} müşterinin ödemesi ${S.alacakGun} günü geçti (toplam ${tl(t)}). Tahsilat listesi için dokunun.', style: const TextStyle(fontWeight: FontWeight.w600))),
+              const Icon(Icons.chevron_right, color: grey),
+            ]),
+          ));
+}
+
+Widget agingCard() {
+  final a = S.aging;
+  final tot = a.fold<double>(0.0, (x, y) => x + y);
+  const labels = ['0–30 gün', '31–90 gün', '91–180 gün', '180+ gün'];
+  const cols = [green, blue, orange, red];
+  return Box(
+    child: Column(children: [
+      for (var i = 0; i < 4; i++)
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: 5),
+          child: Row(children: [
+            SizedBox(width: 78, child: Text(labels[i], style: const TextStyle(fontSize: 12.5))),
+            Expanded(child: ClipRRect(borderRadius: BorderRadius.circular(6), child: LinearProgressIndicator(value: tot == 0 ? 0 : a[i] / tot, color: cols[i], backgroundColor: line, minHeight: 10))),
+            SizedBox(width: 96, child: Text(tl(a[i]), textAlign: TextAlign.right, style: const TextStyle(fontWeight: FontWeight.w600))),
+          ]),
+        ),
+    ]),
+  );
 }
